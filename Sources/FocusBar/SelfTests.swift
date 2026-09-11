@@ -133,6 +133,7 @@ enum FocusSelfTests {
         try expect(PillLayout.text(title: "work", marker: "") == "work", "markerless content must contain only its visible title")
         try expect(PillLayout.text(title: "pd", marker: "●") == "pd  ●", "tracking content must contain only its visible title and dot")
         try expect(PillLayout.horizontalInset == 12, "the pill must add equal explicit insets around its centered content")
+        try expect(PillLayout.idleTemplateImage(title: "work").isTemplate, "the idle pill must use native template rendering")
     }
 
     private static func makeStore(clock: SelfTestClock) -> FocusStore {

@@ -153,38 +153,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
         let isTracking = store.activeTaskID != nil
         let isComplete = task.map { store.elapsed(for: $0) >= $0.targetSeconds } ?? false
 
-        let marker = isTracking ? "●" : ""
         let completeColor = NSColor.systemGreen
-        let filledText = NSColor(srgbRed: 0.12, green: 0.12, blue: 0.14, alpha: 1)
-        let idleText = NSColor.labelColor
-        let standardText = isTracking ? filledText : idleText
-        let markerColor: NSColor = isTracking
-            ? (isComplete ? completeColor : .systemRed)
-            : completeColor
-        let titleColor = standardText
-        pillLabel.alphaValue = isTracking ? 1 : (isComplete ? 0.78 : 0.60)
         if isTracking {
+            let marker = "●"
+            let titleColor = NSColor(srgbRed: 0.12, green: 0.12, blue: 0.14, alpha: 1)
+            let markerColor: NSColor = isComplete ? completeColor : .systemRed
+            let markerAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: markerColor, .font: NSFont.systemFont(ofSize: 10, weight: .bold)]
+            let titleAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: titleColor, .font: NSFont.systemFont(ofSize: 12, weight: .semibold)]
+            let pillText = PillLayout.text(title: title, marker: marker)
+            let rendered = NSMutableAttributedString(string: pillText, attributes: titleAttributes)
+            let markerRange = (pillText as NSString).range(of: marker, options: .backwards)
+            rendered.addAttributes(markerAttributes, range: markerRange)
+
+            button.image = nil
+            button.imagePosition = .noImage
+            button.contentTintColor = nil
+            pillLabel.isHidden = false
+            pillLabel.attributedStringValue = rendered
+            pillLabel.invalidateIntrinsicContentSize()
             button.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.96).cgColor
             button.layer?.borderWidth = 0.5
             button.layer?.borderColor = NSColor.black.withAlphaComponent(0.10).cgColor
+            statusItem.length = PillLayout.width(forContentWidth: rendered.size().width)
         } else {
+            let image = PillLayout.idleTemplateImage(title: title)
+            pillLabel.isHidden = true
+            button.image = image
+            button.imagePosition = .imageOnly
+            button.imageScaling = .scaleNone
+            button.contentTintColor = isComplete ? completeColor : nil
             button.layer?.backgroundColor = NSColor.clear.cgColor
-            button.layer?.borderWidth = 1
-            button.layer?.borderColor = (isComplete
-                ? completeColor.withAlphaComponent(0.78)
-                : idleText.withAlphaComponent(0.28)).cgColor
+            button.layer?.borderWidth = 0
+            statusItem.length = image.size.width
         }
-        let markerAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: markerColor, .font: NSFont.systemFont(ofSize: 10, weight: .bold)]
-        let titleAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: titleColor, .font: NSFont.systemFont(ofSize: 12, weight: .semibold)]
-        let pillText = PillLayout.text(title: title, marker: marker)
-        let rendered = NSMutableAttributedString(string: pillText, attributes: titleAttributes)
-        if !marker.isEmpty {
-            let markerRange = (pillText as NSString).range(of: marker, options: .backwards)
-            rendered.addAttributes(markerAttributes, range: markerRange)
-        }
-        pillLabel.attributedStringValue = rendered
-        pillLabel.invalidateIntrinsicContentSize()
-        statusItem.length = ceil(rendered.size().width) + (PillLayout.horizontalInset * 2)
         button.needsLayout = true
         button.layoutSubtreeIfNeeded()
         button.toolTip = task.map { "\($0.name): \(store.formattedElapsed(for: $0)) today" } ?? "Choose a focus area"
@@ -277,9 +278,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
 
 enum PillLayout {
     static let horizontalInset: CGFloat = 12
+    static let height: CGFloat = 20
 
     static func text(title: String, marker: String) -> String {
         marker.isEmpty ? title : "\(title)  \(marker)"
+    }
+
+    static func width(forContentWidth contentWidth: CGFloat) -> CGFloat {
+        ceil(contentWidth) + (horizontalInset * 2)
+    }
+
+    static func idleTemplateImage(title: String) -> NSImage {
+        let attributes: [NSAttributedString.Key: Any] = [
+            .foregroundColor: NSColor.black,
+            .font: NSFont.systemFont(ofSize: 12, weight: .semibold)
+        ]
+        let text = NSAttributedString(string: title, attributes: attributes)
+        let size = NSSize(width: width(forContentWidth: text.size().width), height: height)
+        let image = NSImage(size: size, flipped: false) { rect in
+            NSColor.black.setStroke()
+            let outline = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 9.5, yRadius: 9.5)
+            outline.lineWidth = 1
+            outline.stroke()
+            let textSize = text.size()
+            text.draw(at: NSPoint(
+                x: floor((rect.width - textSize.width) / 2),
+                y: floor((rect.height - textSize.height) / 2)
+            ))
+            return true
+        }
+        image.isTemplate = true
+        return image
     }
 }
 
