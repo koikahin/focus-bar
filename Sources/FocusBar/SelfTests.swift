@@ -111,7 +111,7 @@ enum FocusSelfTests {
 
     private static func testPillSpacing() throws {
         try expect(PillLayout.text(title: "work", marker: "") == "work", "markerless content must contain only its visible title")
-        try expect(PillLayout.text(title: "pd", marker: "✓") == "pd  ✓", "marked content must contain only its visible title and marker")
+        try expect(PillLayout.text(title: "pd", marker: "●") == "pd  ●", "tracking content must contain only its visible title and dot")
         try expect(PillLayout.horizontalInset == 12, "the pill must add equal explicit insets around its centered content")
     }
 

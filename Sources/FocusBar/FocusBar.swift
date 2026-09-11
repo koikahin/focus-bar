@@ -153,7 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
         let isTracking = store.activeTaskID != nil
         let isComplete = task.map { store.elapsed(for: $0) >= $0.targetSeconds } ?? false
 
-        let marker = isTracking ? "●" : (isComplete ? "✓" : "")
+        let marker = isTracking ? "●" : ""
         let completeColor = NSColor.systemGreen
         let filledText = NSColor(srgbRed: 0.12, green: 0.12, blue: 0.14, alpha: 1)
         let idleText = NSColor.labelColor
