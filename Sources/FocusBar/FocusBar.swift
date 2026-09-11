@@ -44,9 +44,15 @@ struct FocusBarMain {
 }
 
 @MainActor
+private final class PillContentLabel: NSTextField {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcurrency UNUserNotificationCenterDelegate {
     private let store = FocusStore()
     private var statusItem: NSStatusItem!
+    private var pillLabel: PillContentLabel!
     private var ticker: Timer?
     private var settingsWindow: NSWindow?
 
@@ -58,11 +64,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
         button.action = #selector(statusItemPressed(_:))
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         button.isBordered = false
-        button.font = .systemFont(ofSize: 12, weight: .semibold)
+        button.title = ""
+        button.image = nil
         button.wantsLayer = true
         button.layer?.cornerRadius = 10
         button.layer?.borderWidth = 0.5
         button.layer?.borderColor = NSColor.black.withAlphaComponent(0.10).cgColor
+
+        let label = PillContentLabel(frame: .zero)
+        label.isEditable = false
+        label.isSelectable = false
+        label.isBordered = false
+        label.drawsBackground = false
+        label.usesSingleLineMode = true
+        label.lineBreakMode = .byClipping
+        label.translatesAutoresizingMaskIntoConstraints = false
+        button.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: button.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: button.centerYAnchor)
+        ])
+        pillLabel = label
 
         updateStatusItem()
         ticker = Timer.scheduledTimer(timeInterval: 1, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
@@ -131,19 +153,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
         let isTracking = store.activeTaskID != nil
         let isComplete = task.map { store.elapsed(for: $0) >= $0.targetSeconds } ?? false
 
-        let dot = isTracking ? "●" : "○"
-        let completeColor = NSColor(srgbRed: 0.08, green: 0.42, blue: 0.18, alpha: 1)
+        let marker = isTracking ? "●" : (isComplete ? "✓" : "")
+        let completeColor = NSColor.systemGreen
         let filledText = NSColor(srgbRed: 0.12, green: 0.12, blue: 0.14, alpha: 1)
         let idleText = NSColor.labelColor
         let standardText = isTracking ? filledText : idleText
-        let dotColor: NSColor = isTracking ? .systemRed : (isComplete ? completeColor : standardText.withAlphaComponent(0.55))
-        let titleColor: NSColor = isComplete
-            ? completeColor
-            : standardText
+        let markerColor: NSColor = isTracking
+            ? (isComplete ? completeColor : .systemRed)
+            : completeColor
+        let titleColor = standardText
         if isTracking {
-            button.layer?.backgroundColor = (isComplete
-                ? NSColor(srgbRed: 0.82, green: 0.95, blue: 0.85, alpha: 0.98)
-                : NSColor.white.withAlphaComponent(0.96)).cgColor
+            button.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.96).cgColor
             button.layer?.borderWidth = 0.5
             button.layer?.borderColor = NSColor.black.withAlphaComponent(0.10).cgColor
         } else {
@@ -151,12 +171,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
             button.layer?.borderWidth = 1
             button.layer?.borderColor = (isComplete ? completeColor : idleText.withAlphaComponent(0.45)).cgColor
         }
-        let dotAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: dotColor, .font: NSFont.systemFont(ofSize: 10, weight: .bold)]
+        let markerAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: markerColor, .font: NSFont.systemFont(ofSize: 10, weight: .bold)]
         let titleAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: titleColor, .font: NSFont.systemFont(ofSize: 12, weight: .semibold)]
-        let rendered = NSMutableAttributedString(string: "  \(title)  ", attributes: titleAttributes)
-        rendered.append(NSAttributedString(string: dot, attributes: dotAttributes))
-        rendered.append(NSAttributedString(string: "  ", attributes: titleAttributes))
-        button.attributedTitle = rendered
+        let pillText = PillLayout.text(title: title, marker: marker)
+        let rendered = NSMutableAttributedString(string: pillText, attributes: titleAttributes)
+        if !marker.isEmpty {
+            let markerRange = (pillText as NSString).range(of: marker, options: .backwards)
+            rendered.addAttributes(markerAttributes, range: markerRange)
+        }
+        pillLabel.attributedStringValue = rendered
+        pillLabel.invalidateIntrinsicContentSize()
+        statusItem.length = ceil(rendered.size().width) + (PillLayout.horizontalInset * 2)
+        button.needsLayout = true
+        button.layoutSubtreeIfNeeded()
         button.toolTip = task.map { "\($0.name): \(store.formattedElapsed(for: $0)) today" } ?? "Choose a focus area"
     }
 
@@ -243,6 +270,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
+}
+
+enum PillLayout {
+    static let horizontalInset: CGFloat = 12
+
+    static func text(title: String, marker: String) -> String {
+        marker.isEmpty ? title : "\(title)  \(marker)"
+    }
 }
 
 struct FocusTask: Codable, Identifiable, Equatable {

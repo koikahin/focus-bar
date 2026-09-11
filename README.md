@@ -20,7 +20,7 @@ The app lives in the menu bar and has no Dock icon. A left click starts or stops
 
 Use **Manage Focus Areas…** to add or remove areas, edit daily targets, and see the live active timer. Click the displayed elapsed time to edit it inline: Return saves, Escape cancels, and a timer that was running resumes afterward. The options window behaves like a regular macOS window while open, including Cmd+Tab support; Escape closes it when no time edit is active.
 
-Daily totals in the right-click menu show time as `H:MM:SS`; the pill stays uncluttered, showing only the current focus area and state dot. It is transparent and outlined while idle, then filled while tracking. The native right-click menu and management window automatically follow the system light/dark setting. Daily totals use the local focus day: they reset at 6:00 AM. While tracking, the dot is red. When an area's daily target has been reached, its label and outline use green.
+Daily totals in the right-click menu show time as `H:MM:SS`; the pill stays uncluttered. While tracking, it uses a white fill and a red dot; the dot turns green when the daily target is reached. When stopped, the pill is transparent and shows a green tick only if the target is complete. The native right-click menu and management window automatically follow the system light/dark setting. Daily totals use the local focus day and reset at 6:00 AM.
 
 Daily targets use a simple `H:MM` format (for example, `1:17`) and reset along with each day's totals at 6:00 AM. Manual elapsed-time overrides accept either `H:MM` or `H:MM:SS`. Focus tracking pauses while your Mac sleeps and resumes on wake; the next wake also performs the 6:00 AM local-time rollover before any new time is counted.
 

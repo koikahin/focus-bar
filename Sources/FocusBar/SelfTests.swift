@@ -23,7 +23,8 @@ enum FocusSelfTests {
             try testSleepRollover()
             try testCompletionEvent()
             try testRemoval()
-            print("FocusBar self-tests passed (6/6)")
+            try testPillSpacing()
+            print("FocusBar self-tests passed (7/7)")
             return true
         } catch {
             FileHandle.standardError.write(Data("FocusBar self-test failed: \(error)\n".utf8))
@@ -106,6 +107,12 @@ enum FocusSelfTests {
         try expect(store.tasks.contains(where: { $0.id == work.id }) == false, "removed area must leave task list")
         try expect(store.activeTaskID == nil, "removing an active area must stop its timer")
         try expect(store.completionHistory[work.id] == nil, "removing an area must remove its history")
+    }
+
+    private static func testPillSpacing() throws {
+        try expect(PillLayout.text(title: "work", marker: "") == "work", "markerless content must contain only its visible title")
+        try expect(PillLayout.text(title: "pd", marker: "✓") == "pd  ✓", "marked content must contain only its visible title and marker")
+        try expect(PillLayout.horizontalInset == 12, "the pill must add equal explicit insets around its centered content")
     }
 
     private static func makeStore(clock: SelfTestClock) -> FocusStore {
