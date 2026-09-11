@@ -20,11 +20,12 @@ enum FocusSelfTests {
             try testElapsedInput()
             try testSelectionStopsTimer()
             try testOverrideRebasesTimer()
+            try testElapsedEditPauseAndResume()
             try testSleepRollover()
             try testCompletionEvent()
             try testRemoval()
             try testPillSpacing()
-            print("FocusBar self-tests passed (7/7)")
+            print("FocusBar self-tests passed (8/8)")
             return true
         } catch {
             FileHandle.standardError.write(Data("FocusBar self-test failed: \(error)\n".utf8))
@@ -61,6 +62,25 @@ enum FocusSelfTests {
         clock.now = clock.now.addingTimeInterval(5)
         store.pulse()
         try expect(abs(store.elapsed(for: work) - 3_605) < 0.001, "override must rebase a running timer")
+    }
+
+    private static func testElapsedEditPauseAndResume() throws {
+        let clock = SelfTestClock(localDate(year: 2026, month: 9, day: 9, hour: 10))
+        let store = makeStore(clock: clock)
+        guard let work = store.tasks.first(where: { $0.name == "work" }),
+              let pd = store.tasks.first(where: { $0.name == "pd" }) else { throw Failure(description: "default areas missing") }
+        store.start(taskID: work.id)
+        clock.now = clock.now.addingTimeInterval(35)
+        let timerToResume = store.activeTaskID
+        store.finishCurrentSession()
+        try expect(store.activeTaskID == nil, "editing today's time must pause the running timer")
+        store.setElapsed(for: pd, to: 600)
+        if let timerToResume { store.start(taskID: timerToResume) }
+        try expect(store.activeTaskID == work.id, "the timer running before an edit must resume")
+        clock.now = clock.now.addingTimeInterval(10)
+        store.pulse()
+        try expect(abs(store.elapsed(for: work) - 45) < 0.001, "the resumed timer must continue from its paused total")
+        try expect(abs(store.elapsed(for: pd) - 600) < 0.001, "editing another area must save its new total")
     }
 
     private static func testSleepRollover() throws {

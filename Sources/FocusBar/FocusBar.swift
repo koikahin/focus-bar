@@ -162,6 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
             ? (isComplete ? completeColor : .systemRed)
             : completeColor
         let titleColor = standardText
+        pillLabel.alphaValue = isTracking ? 1 : (isComplete ? 0.78 : 0.60)
         if isTracking {
             button.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.96).cgColor
             button.layer?.borderWidth = 0.5
@@ -169,7 +170,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
         } else {
             button.layer?.backgroundColor = NSColor.clear.cgColor
             button.layer?.borderWidth = 1
-            button.layer?.borderColor = (isComplete ? completeColor : idleText.withAlphaComponent(0.45)).cgColor
+            button.layer?.borderColor = (isComplete
+                ? completeColor.withAlphaComponent(0.78)
+                : idleText.withAlphaComponent(0.28)).cgColor
         }
         let markerAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: markerColor, .font: NSFont.systemFont(ofSize: 10, weight: .bold)]
         let titleAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: titleColor, .font: NSFont.systemFont(ofSize: 12, weight: .semibold)]
@@ -620,6 +623,88 @@ enum ElapsedInput {
     }
 }
 
+private struct CommitOnBlurTextField: NSViewRepresentable {
+    @Binding var text: String
+    var onCommit: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    func makeNSView(context: Context) -> NSTextField {
+        let field = NSTextField(string: text)
+        field.placeholderString = "H:MM or H:MM:SS"
+        field.alignment = .right
+        field.font = .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+        field.usesSingleLineMode = true
+        field.delegate = context.coordinator
+        context.coordinator.textField = field
+        context.coordinator.installOutsideClickMonitor()
+        DispatchQueue.main.async { [weak field] in
+            guard let field else { return }
+            field.window?.makeFirstResponder(field)
+            field.selectText(nil)
+        }
+        return field
+    }
+
+    func updateNSView(_ field: NSTextField, context: Context) {
+        context.coordinator.parent = self
+        if field.stringValue != text { field.stringValue = text }
+    }
+
+    static func dismantleNSView(_ field: NSTextField, coordinator: Coordinator) {
+        coordinator.removeOutsideClickMonitor()
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: CommitOnBlurTextField
+        weak var textField: NSTextField?
+        private var outsideClickMonitor: Any?
+
+        init(parent: CommitOnBlurTextField) {
+            self.parent = parent
+        }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            parent.text = field.stringValue
+        }
+
+        func controlTextDidEndEditing(_ notification: Notification) {
+            commitCurrentValue()
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            guard commandSelector == #selector(NSResponder.insertNewline(_:))
+                    || commandSelector == #selector(NSResponder.cancelOperation(_:)) else { return false }
+            parent.text = textView.string
+            commitCurrentValue()
+            return true
+        }
+
+        func installOutsideClickMonitor() {
+            outsideClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+                guard let self, let field = self.textField, event.window === field.window else { return event }
+                let point = field.convert(event.locationInWindow, from: nil)
+                guard !field.bounds.contains(point) else { return event }
+                DispatchQueue.main.async { [weak self] in self?.commitCurrentValue() }
+                return event
+            }
+        }
+
+        func removeOutsideClickMonitor() {
+            if let outsideClickMonitor { NSEvent.removeMonitor(outsideClickMonitor) }
+            outsideClickMonitor = nil
+        }
+
+        private func commitCurrentValue() {
+            guard let textField else { return }
+            parent.text = textField.stringValue
+            parent.onCommit()
+        }
+    }
+}
+
 struct SettingsView: View {
     @Bindable var store: FocusStore
     var onChange: () -> Void
@@ -628,9 +713,6 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            TimerStatusView(store: store, onChange: onChange)
-                .padding(16)
-            Divider()
             List {
                 Section("Daily focus areas") {
                     ForEach(store.tasks) { task in
@@ -661,101 +743,6 @@ struct SettingsView: View {
     }
 }
 
-private struct TimerStatusView: View {
-    @Bindable var store: FocusStore
-    var onChange: () -> Void
-    @State private var isEditing = false
-    @State private var editValue = ""
-    @State private var editTaskID: UUID?
-    @State private var resumeAfterEditing = false
-    @FocusState private var timeFieldFocused: Bool
-
-    var body: some View {
-        if let task = store.currentTask {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Circle()
-                        .fill(store.activeTaskID == task.id ? .red : .secondary)
-                        .frame(width: 8, height: 8)
-                    Text(store.activeTaskID == task.id ? "Recording \(task.name)" : "Ready to track \(task.name)")
-                        .font(.headline)
-                    Spacer()
-                    if isEditing {
-                        TextField("H:MM or H:MM:SS", text: $editValue)
-                            .multilineTextAlignment(.trailing)
-                            .font(.system(.title3, design: .monospaced).weight(.semibold))
-                            .frame(width: 150)
-                            .focused($timeFieldFocused)
-                            .onSubmit { commitEditing() }
-                            .onExitCommand { cancelEditing() }
-                    } else {
-                        Button { beginEditing(task) } label: {
-                            Text(store.formattedElapsed(for: task))
-                                .font(.system(.title3, design: .monospaced).weight(.semibold))
-                        }
-                        .buttonStyle(.plain)
-                        .help("Click to edit today's time")
-                    }
-                }
-                HStack {
-                    Button(store.activeTaskID == task.id ? "Stop timer" : "Start timer") {
-                        store.toggleCurrentTask()
-                        onChange()
-                    }
-                    Button("Reset today") {
-                        store.resetElapsed(for: task)
-                        onChange()
-                    }
-                    Spacer()
-                    Text("Daily target \(store.formatted(targetSeconds: task.targetSeconds))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                if isEditing && ElapsedInput.seconds(from: editValue) == nil {
-                    Text("Enter H:MM or H:MM:SS · Return saves · Escape cancels")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                }
-            }
-        } else {
-            Text("Add a focus area to start tracking.")
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    private func beginEditing(_ task: FocusTask) {
-        editTaskID = task.id
-        resumeAfterEditing = store.activeTaskID == task.id
-        if resumeAfterEditing { store.finishCurrentSession() }
-        editValue = store.formattedElapsed(for: task)
-        isEditing = true
-        onChange()
-        Task { @MainActor in timeFieldFocused = true }
-    }
-
-    private func commitEditing() {
-        guard let id = editTaskID,
-              let task = store.tasks.first(where: { $0.id == id }),
-              let seconds = ElapsedInput.seconds(from: editValue) else { return }
-        store.setElapsed(for: task, to: seconds)
-        finishEditing(resume: resumeAfterEditing, taskID: id)
-    }
-
-    private func cancelEditing() {
-        finishEditing(resume: resumeAfterEditing, taskID: editTaskID)
-    }
-
-    private func finishEditing(resume: Bool, taskID: UUID?) {
-        isEditing = false
-        timeFieldFocused = false
-        editValue = ""
-        editTaskID = nil
-        resumeAfterEditing = false
-        if resume, let taskID { store.start(taskID: taskID) }
-        onChange()
-    }
-}
-
 private struct TaskEditor: View {
     let task: FocusTask
     @Bindable var store: FocusStore
@@ -763,6 +750,9 @@ private struct TaskEditor: View {
     @State private var name: String = ""
     @State private var target = ""
     @State private var confirmingRemoval = false
+    @State private var isEditingElapsed = false
+    @State private var elapsedValue = ""
+    @State private var timerToResume: UUID?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -788,9 +778,39 @@ private struct TaskEditor: View {
                     .foregroundStyle(.red)
             }
             HStack(spacing: 8) {
-                Text("Today \(store.formattedElapsed(for: task))")
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 8, height: 8)
+                Text(isActive ? "Recording" : "Ready")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Button(isActive ? "Stop timer" : "Start timer") {
+                    toggleTimer()
+                }
+                .disabled(isEditingElapsed)
+                Spacer()
+                Text("Today")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if isEditingElapsed {
+                    CommitOnBlurTextField(text: $elapsedValue, onCommit: commitElapsedEditing)
+                        .frame(width: 112)
+                    Button("Reset") { resetElapsed() }
+                } else {
+                    Button { beginElapsedEditing() } label: {
+                        Text(store.formattedElapsed(for: task))
+                            .font(.system(.body, design: .monospaced).weight(.semibold))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Click to edit today's time")
+                }
+            }
+            if isEditingElapsed && ElapsedInput.seconds(from: elapsedValue) == nil {
+                Text("Use H:MM or H:MM:SS. An invalid value keeps the previous time.")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            HStack {
                 Spacer()
                 let streak = store.completionStreak(for: task)
                 Text(streak == 1 ? "1-day streak" : "\(streak)-day streak")
@@ -799,7 +819,10 @@ private struct TaskEditor: View {
             }
             HabitStrip(days: store.recentCompletions(for: task))
         }
-        .onDisappear { save() }
+        .onDisappear {
+            save()
+            commitElapsedEditing()
+        }
         .confirmationDialog("Remove \(task.name)?", isPresented: $confirmingRemoval, titleVisibility: .visible) {
             Button("Remove Focus Area", role: .destructive) {
                 store.remove(task)
@@ -815,6 +838,50 @@ private struct TaskEditor: View {
         guard let targetSeconds = DurationInput.seconds(from: target) else { return }
         store.update(task, name: name.isEmpty ? task.name : name, targetSeconds: targetSeconds)
         target = DurationInput.display(targetSeconds)
+        onChange()
+    }
+
+    private var isActive: Bool { store.activeTaskID == task.id }
+
+    private var statusColor: Color {
+        guard isActive else { return .secondary }
+        return store.elapsed(for: task) >= task.targetSeconds ? .green : .red
+    }
+
+    private func toggleTimer() {
+        if isActive {
+            store.finishCurrentSession()
+        } else {
+            store.start(taskID: task.id)
+        }
+        onChange()
+    }
+
+    private func beginElapsedEditing() {
+        guard !isEditingElapsed else { return }
+        timerToResume = store.activeTaskID
+        if timerToResume != nil { store.finishCurrentSession() }
+        elapsedValue = store.formattedElapsed(for: task)
+        isEditingElapsed = true
+        onChange()
+    }
+
+    private func commitElapsedEditing() {
+        guard isEditingElapsed else { return }
+        finishElapsedEditing(newValue: ElapsedInput.seconds(from: elapsedValue))
+    }
+
+    private func resetElapsed() {
+        finishElapsedEditing(newValue: 0)
+    }
+
+    private func finishElapsedEditing(newValue: TimeInterval?) {
+        let resumeID = timerToResume
+        isEditingElapsed = false
+        elapsedValue = ""
+        timerToResume = nil
+        if let newValue { store.setElapsed(for: task, to: newValue) }
+        if let resumeID { store.start(taskID: resumeID) }
         onChange()
     }
 
