@@ -1,0 +1,27 @@
+# FocusBar
+
+A native macOS menu-bar timer for a small set of daily focus areas.
+
+## Install and launch
+
+```sh
+zsh scripts/install-app.sh
+```
+
+This builds a native `FocusBar.app`, gracefully stops an older running copy, installs it in `~/Applications`, and launches it. Move that app to `/Applications` later if you want it available to every macOS account.
+
+## Development-only run
+
+```sh
+swift run FocusBar
+```
+
+The app lives in the menu bar and has no Dock icon. A left click starts or stops the selected area. The pill is outlined and transparent while idle, then filled while tracking. A right click shows today's totals and lets you switch areas; switching always stops any active timer, so starting remains deliberate.
+
+Use **Manage Focus Areas…** to add or remove areas, edit daily targets, and see the live active timer. Click the displayed elapsed time to edit it inline: Return saves, Escape cancels, and a timer that was running resumes afterward. The options window behaves like a regular macOS window while open, including Cmd+Tab support; Escape closes it when no time edit is active.
+
+Daily totals in the right-click menu show time as `H:MM:SS`; the pill stays uncluttered, showing only the current focus area and state dot. It is transparent and outlined while idle, then filled while tracking. The native right-click menu and management window automatically follow the system light/dark setting. Daily totals use the local focus day: they reset at 6:00 AM. While tracking, the dot is red. When an area's daily target has been reached, its label and outline use green.
+
+Daily targets use a simple `H:MM` format (for example, `1:17`) and reset along with each day's totals at 6:00 AM. Manual elapsed-time overrides accept either `H:MM` or `H:MM:SS`. Focus tracking pauses while your Mac sleeps and resumes on wake; the next wake also performs the 6:00 AM local-time rollover before any new time is counted.
+
+Each focus area shows its last seven completion days and current streak. FocusBar sends a native macOS notification the first time an area reaches its daily target. Data is stored locally in macOS `UserDefaults` under `com.local.focusbar`.
