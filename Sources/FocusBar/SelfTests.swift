@@ -22,10 +22,12 @@ enum FocusSelfTests {
             try testOverrideRebasesTimer()
             try testElapsedEditPauseAndResume()
             try testSleepRollover()
+            try testHabitDayStates()
+            try testHistoricalDailyTarget()
             try testCompletionEvent()
             try testRemoval()
             try testPillSpacing()
-            print("FocusBar self-tests passed (8/8)")
+            print("FocusBar self-tests passed (10/10)")
             return true
         } catch {
             FileHandle.standardError.write(Data("FocusBar self-test failed: \(error)\n".utf8))
@@ -94,9 +96,48 @@ enum FocusSelfTests {
         store.resumeAfterSleep()
         try expect(store.activeTaskID == work.id, "sleeping timer should resume on wake")
         try expect(abs(store.elapsed(for: work)) < 0.001, "new focus day must begin at zero on wake")
+        try expect(store.recentCompletions(for: work).contains(where: { abs($0.elapsedSeconds - 300) < 0.001 }), "wake rollover must preserve the prior focus day's total")
         clock.now = clock.now.addingTimeInterval(10)
         store.pulse()
         try expect(abs(store.elapsed(for: work) - 10) < 0.001, "sleep time must not be counted")
+    }
+
+    private static func testHabitDayStates() throws {
+        let clock = SelfTestClock(localDate(year: 2026, month: 9, day: 9, hour: 10))
+        let store = makeStore(clock: clock)
+        guard let work = store.tasks.first(where: { $0.name == "work" }) else { throw Failure(description: "work area missing") }
+        store.update(work, name: work.name, targetSeconds: 600)
+        guard let updatedWork = store.tasks.first(where: { $0.id == work.id }) else { throw Failure(description: "updated area missing") }
+        store.setElapsed(for: updatedWork, to: 60)
+        try expect(store.recentCompletions(for: updatedWork).count == 10, "the habit strip must show ten focus days")
+        try expect(store.recentCompletions(for: updatedWork).last?.status == .some(.none), "exactly one minute must not receive a partial tick")
+        store.setElapsed(for: updatedWork, to: 61)
+        try expect(store.recentCompletions(for: updatedWork).last?.status == .partial, "more than one minute below target must receive a partial tick")
+        store.setElapsed(for: updatedWork, to: 600)
+        try expect(store.recentCompletions(for: updatedWork).last?.status == .complete, "meeting the daily target must receive a complete tick")
+    }
+
+    private static func testHistoricalDailyTarget() throws {
+        let clock = SelfTestClock(localDate(year: 2026, month: 9, day: 9, hour: 10))
+        let suiteName = "FocusBarSelfTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        let store = FocusStore(defaults: defaults, clock: { clock.now })
+        guard let work = store.tasks.first(where: { $0.name == "work" }) else { throw Failure(description: "work area missing") }
+        store.update(work, name: work.name, targetSeconds: 120)
+        guard let updatedWork = store.tasks.first(where: { $0.id == work.id }) else { throw Failure(description: "updated area missing") }
+        store.setElapsed(for: updatedWork, to: 90)
+        clock.now = localDate(year: 2026, month: 9, day: 10, hour: 6, minute: 1)
+        store.pulse()
+        guard let currentWork = store.tasks.first(where: { $0.id == work.id }) else { throw Failure(description: "current area missing") }
+        store.update(currentWork, name: currentWork.name, targetSeconds: 60)
+        let reloadedStore = FocusStore(defaults: defaults, clock: { clock.now })
+        guard let reloadedWork = reloadedStore.tasks.first(where: { $0.id == work.id }),
+              let historicalDay = reloadedStore.recentCompletions(for: reloadedWork).first(where: { abs($0.elapsedSeconds - 90) < 0.001 }) else {
+            throw Failure(description: "historical day missing")
+        }
+        try expect(abs(historicalDay.targetSeconds - 120) < 0.001, "rollover must preserve that day's configured target")
+        try expect(historicalDay.status == .partial, "later target changes must not recolor a historical day")
     }
 
     private static func testCompletionEvent() throws {

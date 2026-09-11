@@ -54,6 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
     private var statusItem: NSStatusItem!
     private var pillLabel: PillContentLabel!
     private var ticker: Timer?
+    private var openMenuTaskItems: [UUID: NSMenuItem] = [:]
     private var settingsWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -87,7 +88,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
         pillLabel = label
 
         updateStatusItem()
-        ticker = Timer.scheduledTimer(timeInterval: 1, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
+        let ticker = Timer(timeInterval: 1, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
+        RunLoop.main.add(ticker, forMode: .common)
+        self.ticker = ticker
         let workspaceNotifications = NSWorkspace.shared.notificationCenter
         workspaceNotifications.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
         workspaceNotifications.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
@@ -117,6 +120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
     @objc private func tick() {
         store.pulse()
         updateStatusItem()
+        updateOpenMenu()
     }
 
     @objc private func willSleep() {
@@ -193,6 +197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
 
     private func showMenu() {
         store.pulse()
+        openMenuTaskItems.removeAll()
         let menu = NSMenu()
         // No explicit appearance: native NSMenu automatically follows the
         // user's light/dark system setting, including while it is open.
@@ -215,6 +220,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
                 item.image = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: "Complete")
             }
             menu.addItem(item)
+            openMenuTaskItems[task.id] = item
         }
 
         if store.tasks.isEmpty {
@@ -233,6 +239,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
         statusItem.menu = menu
         statusItem.button?.performClick(nil)
         statusItem.menu = nil
+        openMenuTaskItems.removeAll()
+    }
+
+    private func updateOpenMenu() {
+        guard !openMenuTaskItems.isEmpty else { return }
+        for task in store.tasks {
+            guard let item = openMenuTaskItems[task.id] else { continue }
+            let elapsed = store.formattedElapsed(for: task)
+            let target = store.formatted(targetSeconds: task.targetSeconds)
+            item.title = "\(task.name)    \(elapsed) / \(target)"
+            item.state = store.activeTaskID == task.id ? .on : .off
+            item.image = store.elapsed(for: task) >= task.targetSeconds
+                ? NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: "Complete")
+                : nil
+        }
     }
 
     @objc private func selectTask(_ sender: NSMenuItem) {
@@ -326,12 +347,30 @@ private struct FocusSnapshot: Codable {
     var activeStartedAt: Date?
     var currentTaskID: UUID?
     var completionHistory: [UUID: Set<String>]?
+    var dailyElapsedHistory: [UUID: [String: TimeInterval]]?
+    var dailyTargetHistory: [UUID: [String: TimeInterval]]?
+}
+
+enum CompletionDayStatus {
+    case none
+    case partial
+    case complete
 }
 
 struct CompletionDay: Identifiable {
     let id: String
     let date: Date
-    let isComplete: Bool
+    let elapsedSeconds: TimeInterval
+    let targetSeconds: TimeInterval
+    let recordedAsComplete: Bool
+
+    var status: CompletionDayStatus {
+        if recordedAsComplete || elapsedSeconds >= targetSeconds { return .complete }
+        if elapsedSeconds > 60 { return .partial }
+        return .none
+    }
+
+    var isComplete: Bool { status == .complete }
 }
 
 @MainActor @Observable
@@ -344,6 +383,8 @@ final class FocusStore {
     var tasks: [FocusTask] = []
     var totals: [UUID: TimeInterval] = [:]
     var completionHistory: [UUID: Set<String>] = [:]
+    var dailyElapsedHistory: [UUID: [String: TimeInterval]] = [:]
+    var dailyTargetHistory: [UUID: [String: TimeInterval]] = [:]
     var activeTaskID: UUID?
     var activeStartedAt: Date?
     var currentTaskID: UUID?
@@ -387,6 +428,7 @@ final class FocusStore {
         if let id = activeTaskID, let started = activeStartedAt {
             totals[id, default: 0] += max(0, newFocusDayStart.timeIntervalSince(started))
         }
+        recordDailyHistory(for: dayKey, totals: totals)
         recordCompletions(for: dayKey, totals: totals)
         dayKey = key
         totals = [:]
@@ -510,17 +552,32 @@ final class FocusStore {
         tasks.removeAll { $0.id == task.id }
         totals[task.id] = nil
         completionHistory[task.id] = nil
+        dailyElapsedHistory[task.id] = nil
+        dailyTargetHistory[task.id] = nil
         if currentTaskID == task.id { currentTaskID = tasks.first?.id }
         save()
     }
 
-    func recentCompletions(for task: FocusTask, count: Int = 7) -> [CompletionDay] {
+    func recentCompletions(for task: FocusTask, count: Int = 10) -> [CompletionDay] {
         let calendar = Calendar.current
         let currentStart = Self.focusDayStart(for: now)
         return (0..<count).reversed().compactMap { offset in
             guard let date = calendar.date(byAdding: .day, value: -offset, to: currentStart) else { return nil }
             let key = Self.focusDayKey(for: date)
-            return CompletionDay(id: key, date: date, isComplete: completionHistory[task.id]?.contains(key) == true)
+            let isCurrentDay = key == dayKey
+            let elapsedSeconds = isCurrentDay
+                ? elapsed(for: task)
+                : dailyElapsedHistory[task.id]?[key, default: 0] ?? 0
+            let targetSeconds = isCurrentDay
+                ? task.targetSeconds
+                : dailyTargetHistory[task.id]?[key] ?? task.targetSeconds
+            return CompletionDay(
+                id: key,
+                date: date,
+                elapsedSeconds: elapsedSeconds,
+                targetSeconds: targetSeconds,
+                recordedAsComplete: completionHistory[task.id]?.contains(key) == true
+            )
         }
     }
 
@@ -561,6 +618,13 @@ final class FocusStore {
         }
     }
 
+    private func recordDailyHistory(for completedDayKey: String, totals: [UUID: TimeInterval]) {
+        for task in tasks {
+            dailyElapsedHistory[task.id, default: [:]][completedDayKey] = max(0, totals[task.id, default: 0])
+            dailyTargetHistory[task.id, default: [:]][completedDayKey] = task.targetSeconds
+        }
+    }
+
     private func recordCompletion(for task: FocusTask, dayKey completedDayKey: String) {
         let inserted = completionHistory[task.id, default: []].insert(completedDayKey).inserted
         if inserted {
@@ -594,6 +658,22 @@ final class FocusStore {
         activeStartedAt = snapshot.activeStartedAt
         currentTaskID = snapshot.currentTaskID
         completionHistory = snapshot.completionHistory ?? [:]
+        dailyElapsedHistory = snapshot.dailyElapsedHistory ?? [:]
+        dailyTargetHistory = snapshot.dailyTargetHistory ?? [:]
+
+        // Older snapshots only knew whether a day was complete. Preserve
+        // those green days by treating the target as the minimum known total;
+        // exact elapsed and target history is recorded from this version on.
+        for task in tasks {
+            for completedDayKey in completionHistory[task.id, default: []] {
+                if dailyElapsedHistory[task.id]?[completedDayKey] == nil {
+                    dailyElapsedHistory[task.id, default: [:]][completedDayKey] = task.targetSeconds
+                }
+                if dailyTargetHistory[task.id]?[completedDayKey] == nil {
+                    dailyTargetHistory[task.id, default: [:]][completedDayKey] = task.targetSeconds
+                }
+            }
+        }
     }
 
     private func save() {
@@ -604,7 +684,9 @@ final class FocusStore {
             activeTaskID: activeTaskID,
             activeStartedAt: activeStartedAt,
             currentTaskID: currentTaskID,
-            completionHistory: completionHistory
+            completionHistory: completionHistory,
+            dailyElapsedHistory: dailyElapsedHistory,
+            dailyTargetHistory: dailyTargetHistory
         )
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         defaults.set(data, forKey: defaultsKey)
@@ -935,19 +1017,31 @@ private struct HabitStrip: View {
     let days: [CompletionDay]
 
     var body: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 6) {
             ForEach(days) { day in
-                VStack(spacing: 3) {
-                    Text(day.date, format: .dateTime.weekday(.narrow))
-                    Image(systemName: day.isComplete ? "checkmark.circle.fill" : "circle")
-                        .foregroundStyle(day.isComplete ? Color.green : Color.secondary)
-                    Text(day.date, format: .dateTime.day())
+                VStack(spacing: 4) {
+                    HStack(spacing: 3) {
+                        Text(day.date, format: .dateTime.weekday(.narrow))
+                        Text(day.date, format: .dateTime.day())
+                    }
+                    Image(systemName: day.status == .none ? "circle" : "checkmark.circle.fill")
+                        .foregroundStyle(statusColor(for: day))
+                    Text(DurationInput.display(day.elapsedSeconds))
+                        .foregroundStyle(.secondary)
                 }
                 .font(.caption2)
                 .frame(maxWidth: .infinity)
             }
         }
         .accessibilityElement(children: .contain)
+    }
+
+    private func statusColor(for day: CompletionDay) -> Color {
+        switch day.status {
+        case .none: .secondary
+        case .partial: .yellow
+        case .complete: .green
+        }
     }
 }
 
