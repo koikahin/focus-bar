@@ -1,6 +1,6 @@
-# FocusBar resolved requirements
+# FocusBar requirements
 
-This document is the source of truth for the product behavior agreed during the original design and implementation conversation. Later decisions listed here supersede earlier ideas.
+This document is the source of truth for FocusBar product behavior.
 
 ## Product purpose
 
@@ -116,4 +116,3 @@ FocusBar is a native macOS menu-bar app for tracking focused time against a smal
 - Run `swift run FocusBar --self-test` after behavioral changes.
 - Preserve tests for selection-versus-start behavior, elapsed overrides, pause/resume around editing, 6:00 AM rollover after sleep, interruption-notification deduplication, historical daily targets, completion events, removal, and pill spacing/template rendering.
 - For requested releases, build, stop the current installed run, reinstall, relaunch, and verify only one FocusBar instance is running.
-
