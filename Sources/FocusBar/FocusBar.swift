@@ -48,6 +48,40 @@ private final class PillContentLabel: NSTextField {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
+struct SystemInterruptionState {
+    private(set) var stoppedTaskName: String?
+    private(set) var isSleeping = false
+    private(set) var isSessionInactive = false
+
+    mutating func recordStoppedTask(_ name: String) {
+        if stoppedTaskName == nil { stoppedTaskName = name }
+    }
+
+    mutating func beganSleep() {
+        isSleeping = true
+    }
+
+    mutating func sessionResigned() {
+        isSessionInactive = true
+    }
+
+    mutating func woke() -> String? {
+        isSleeping = false
+        return takeNoticeIfReady()
+    }
+
+    mutating func sessionBecameActive() -> String? {
+        isSessionInactive = false
+        return takeNoticeIfReady()
+    }
+
+    private mutating func takeNoticeIfReady() -> String? {
+        guard !isSleeping, !isSessionInactive else { return nil }
+        defer { stoppedTaskName = nil }
+        return stoppedTaskName
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcurrency UNUserNotificationCenterDelegate {
     private let store = FocusStore()
@@ -56,6 +90,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
     private var ticker: Timer?
     private var openMenuTaskItems: [UUID: NSMenuItem] = [:]
     private var settingsWindow: NSWindow?
+    private var systemInterruption = SystemInterruptionState()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -94,27 +129,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
         let workspaceNotifications = NSWorkspace.shared.notificationCenter
         workspaceNotifications.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
         workspaceNotifications.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
+        workspaceNotifications.addObserver(self, selector: #selector(sessionDidResignActive), name: NSWorkspace.sessionDidResignActiveNotification, object: nil)
+        workspaceNotifications.addObserver(self, selector: #selector(sessionDidBecomeActive), name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
+        let distributedNotifications = DistributedNotificationCenter.default()
+        distributedNotifications.addObserver(self, selector: #selector(sessionDidResignActive), name: .init("com.apple.screenIsLocked"), object: nil)
+        distributedNotifications.addObserver(self, selector: #selector(sessionDidBecomeActive), name: .init("com.apple.screenIsUnlocked"), object: nil)
 
         let notifications = UNUserNotificationCenter.current()
         notifications.delegate = self
         notifications.requestAuthorization(options: [.alert, .sound]) { _, _ in }
-        store.onTaskCompleted = { task, dayKey in
-            let content = UNMutableNotificationContent()
-            content.title = "Daily target complete"
-            content.body = "You reached your daily \(task.name) target."
-            content.sound = .default
-            let request = UNNotificationRequest(
+        store.onTaskCompleted = { [weak self] task, dayKey in
+            self?.deliverNotification(
                 identifier: "focusbar.\(task.id.uuidString).\(dayKey)",
-                content: content,
-                trigger: nil
+                title: "Daily target complete",
+                body: "You reached your daily \(task.name) target."
             )
-            notifications.add(request)
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         store.finishCurrentSession()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+        DistributedNotificationCenter.default().removeObserver(self)
     }
 
     @objc private func tick() {
@@ -124,13 +160,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
     }
 
     @objc private func willSleep() {
-        store.pauseForSleep()
-        updateStatusItem()
+        systemInterruption.beganSleep()
+        stopTimerForSystemInterruption()
     }
 
     @objc private func didWake() {
-        store.resumeAfterSleep()
+        store.refreshDayIfNeeded()
+        presentStoppedTimerNotice(for: systemInterruption.woke())
         updateStatusItem()
+        updateOpenMenu()
+    }
+
+    @objc private func sessionDidResignActive() {
+        systemInterruption.sessionResigned()
+        stopTimerForSystemInterruption()
+    }
+
+    @objc private func sessionDidBecomeActive() {
+        store.refreshDayIfNeeded()
+        presentStoppedTimerNotice(for: systemInterruption.sessionBecameActive())
+        updateStatusItem()
+        updateOpenMenu()
+    }
+
+    private func stopTimerForSystemInterruption() {
+        if let stoppedTask = store.stopForSystemInterruption() {
+            systemInterruption.recordStoppedTask(stoppedTask.name)
+        }
+        updateStatusItem()
+        updateOpenMenu()
+    }
+
+    private func presentStoppedTimerNotice(for taskName: String?) {
+        guard let taskName else { return }
+        deliverNotification(
+            identifier: "focusbar.timer-stopped.\(UUID().uuidString)",
+            title: "Focus timer stopped",
+            body: "The \(taskName) timer was stopped while your Mac was locked or asleep."
+        )
+    }
+
+    private func deliverNotification(identifier: String, title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        UNUserNotificationCenter.current().add(UNNotificationRequest(
+            identifier: identifier,
+            content: content,
+            trigger: nil
+        ))
     }
 
     func userNotificationCenter(
@@ -179,13 +258,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
             button.layer?.borderWidth = 0.5
             button.layer?.borderColor = NSColor.black.withAlphaComponent(0.10).cgColor
             statusItem.length = PillLayout.width(forContentWidth: rendered.size().width)
+        } else if isComplete {
+            let image = PillLayout.idleTemplateImage(title: title, drawsOutline: false)
+            pillLabel.isHidden = true
+            button.image = image
+            button.imagePosition = .imageOnly
+            button.imageScaling = .scaleNone
+            button.contentTintColor = nil
+            button.layer?.backgroundColor = NSColor.clear.cgColor
+            button.layer?.borderWidth = 1
+            button.layer?.borderColor = completeColor.cgColor
+            statusItem.length = image.size.width
         } else {
             let image = PillLayout.idleTemplateImage(title: title)
             pillLabel.isHidden = true
             button.image = image
             button.imagePosition = .imageOnly
             button.imageScaling = .scaleNone
-            button.contentTintColor = isComplete ? completeColor : nil
+            button.contentTintColor = nil
             button.layer?.backgroundColor = NSColor.clear.cgColor
             button.layer?.borderWidth = 0
             statusItem.length = image.size.width
@@ -309,7 +399,7 @@ enum PillLayout {
         ceil(contentWidth) + (horizontalInset * 2)
     }
 
-    static func idleTemplateImage(title: String) -> NSImage {
+    static func idleTemplateImage(title: String, drawsOutline: Bool = true) -> NSImage {
         let attributes: [NSAttributedString.Key: Any] = [
             .foregroundColor: NSColor.black,
             .font: NSFont.systemFont(ofSize: 12, weight: .semibold)
@@ -317,10 +407,12 @@ enum PillLayout {
         let text = NSAttributedString(string: title, attributes: attributes)
         let size = NSSize(width: width(forContentWidth: text.size().width), height: height)
         let image = NSImage(size: size, flipped: false) { rect in
-            NSColor.black.setStroke()
-            let outline = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 9.5, yRadius: 9.5)
-            outline.lineWidth = 1
-            outline.stroke()
+            if drawsOutline {
+                NSColor.black.setStroke()
+                let outline = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 9.5, yRadius: 9.5)
+                outline.lineWidth = 1
+                outline.stroke()
+            }
             let textSize = text.size()
             text.draw(at: NSPoint(
                 x: floor((rect.width - textSize.width) / 2),
@@ -390,7 +482,6 @@ final class FocusStore {
     var currentTaskID: UUID?
     var now: Date
     private var dayKey: String
-    private var taskToResumeAfterWake: UUID?
 
     var currentTask: FocusTask? {
         guard let id = activeTaskID ?? currentTaskID else { return tasks.first }
@@ -496,22 +587,13 @@ final class FocusStore {
         save()
     }
 
-    func pauseForSleep() {
+    func stopForSystemInterruption() -> FocusTask? {
         let timestamp = clock()
         refreshDayIfNeeded(at: timestamp)
-        taskToResumeAfterWake = activeTaskID
+        guard let id = activeTaskID,
+              let task = tasks.first(where: { $0.id == id }) else { return nil }
         finishCurrentSession(at: timestamp)
-    }
-
-    func resumeAfterSleep() {
-        let timestamp = clock()
-        refreshDayIfNeeded(at: timestamp)
-        defer { taskToResumeAfterWake = nil }
-        guard let id = taskToResumeAfterWake, tasks.contains(where: { $0.id == id }) else { return }
-        currentTaskID = id
-        activeTaskID = id
-        activeStartedAt = timestamp
-        save()
+        return task
     }
 
     func setElapsed(for task: FocusTask, to seconds: TimeInterval) {
@@ -748,12 +830,7 @@ private struct CommitOnBlurTextField: NSViewRepresentable {
         field.usesSingleLineMode = true
         field.delegate = context.coordinator
         context.coordinator.textField = field
-        context.coordinator.installOutsideClickMonitor()
-        DispatchQueue.main.async { [weak field] in
-            guard let field else { return }
-            field.window?.makeFirstResponder(field)
-            field.selectText(nil)
-        }
+        context.coordinator.activateAfterPresentation()
         return field
     }
 
@@ -771,6 +848,7 @@ private struct CommitOnBlurTextField: NSViewRepresentable {
         var parent: CommitOnBlurTextField
         weak var textField: NSTextField?
         private var outsideClickMonitor: Any?
+        private var acceptsBlurCommit = false
 
         init(parent: CommitOnBlurTextField) {
             self.parent = parent
@@ -782,6 +860,7 @@ private struct CommitOnBlurTextField: NSViewRepresentable {
         }
 
         func controlTextDidEndEditing(_ notification: Notification) {
+            guard acceptsBlurCommit else { return }
             commitCurrentValue()
         }
 
@@ -793,7 +872,32 @@ private struct CommitOnBlurTextField: NSViewRepresentable {
             return true
         }
 
+        func activateAfterPresentation() {
+            acceptsBlurCommit = false
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let field = self.textField, let window = field.window else { return }
+                window.makeFirstResponder(field)
+                field.selectText(nil)
+
+                // SwiftUI can perform another responder transition after it
+                // swaps the time button for this AppKit field. Reassert focus
+                // on the following turn, then begin treating blur as user
+                // intent. This prevents the opening click from closing the
+                // editor immediately.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, let field = self.textField, let window = field.window else { return }
+                    if window.firstResponder !== field.currentEditor() {
+                        window.makeFirstResponder(field)
+                        field.selectText(nil)
+                    }
+                    self.acceptsBlurCommit = true
+                    self.installOutsideClickMonitor()
+                }
+            }
+        }
+
         func installOutsideClickMonitor() {
+            guard outsideClickMonitor == nil else { return }
             outsideClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
                 guard let self, let field = self.textField, event.window === field.window else { return event }
                 let point = field.convert(event.locationInWindow, from: nil)
@@ -806,6 +910,7 @@ private struct CommitOnBlurTextField: NSViewRepresentable {
         func removeOutsideClickMonitor() {
             if let outsideClickMonitor { NSEvent.removeMonitor(outsideClickMonitor) }
             outsideClickMonitor = nil
+            acceptsBlurCommit = false
         }
 
         private func commitCurrentValue() {

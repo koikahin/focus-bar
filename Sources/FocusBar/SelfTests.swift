@@ -22,12 +22,13 @@ enum FocusSelfTests {
             try testOverrideRebasesTimer()
             try testElapsedEditPauseAndResume()
             try testSleepRollover()
+            try testSystemInterruptionNotice()
             try testHabitDayStates()
             try testHistoricalDailyTarget()
             try testCompletionEvent()
             try testRemoval()
             try testPillSpacing()
-            print("FocusBar self-tests passed (10/10)")
+            print("FocusBar self-tests passed (11/11)")
             return true
         } catch {
             FileHandle.standardError.write(Data("FocusBar self-test failed: \(error)\n".utf8))
@@ -91,15 +92,32 @@ enum FocusSelfTests {
         guard let work = store.tasks.first(where: { $0.name == "work" }) else { throw Failure(description: "work area missing") }
         store.start(taskID: work.id)
         clock.now = localDate(year: 2026, month: 9, day: 9, hour: 5, minute: 55)
-        store.pauseForSleep()
+        let stoppedTask = store.stopForSystemInterruption()
+        try expect(stoppedTask?.id == work.id, "sleep must report the timer it stopped")
+        try expect(store.activeTaskID == nil, "sleep must stop the running timer")
         clock.now = localDate(year: 2026, month: 9, day: 10, hour: 9)
-        store.resumeAfterSleep()
-        try expect(store.activeTaskID == work.id, "sleeping timer should resume on wake")
+        store.refreshDayIfNeeded()
+        try expect(store.activeTaskID == nil, "a timer stopped for sleep must stay stopped after wake")
         try expect(abs(store.elapsed(for: work)) < 0.001, "new focus day must begin at zero on wake")
         try expect(store.recentCompletions(for: work).contains(where: { abs($0.elapsedSeconds - 300) < 0.001 }), "wake rollover must preserve the prior focus day's total")
         clock.now = clock.now.addingTimeInterval(10)
         store.pulse()
-        try expect(abs(store.elapsed(for: work) - 10) < 0.001, "sleep time must not be counted")
+        try expect(abs(store.elapsed(for: work)) < 0.001, "a stopped timer must not restart or count time after wake")
+    }
+
+    private static func testSystemInterruptionNotice() throws {
+        var interruption = SystemInterruptionState()
+        interruption.sessionResigned()
+        interruption.recordStoppedTask("work")
+        interruption.beganSleep()
+        try expect(interruption.woke() == nil, "wake must wait for unlock before presenting the stopped-timer notice")
+        try expect(interruption.sessionBecameActive() == "work", "unlock must release one stopped-timer notice")
+        try expect(interruption.sessionBecameActive() == nil, "overlapping wake events must not duplicate the notice")
+
+        var sleepOnly = SystemInterruptionState()
+        sleepOnly.beganSleep()
+        sleepOnly.recordStoppedTask("pd")
+        try expect(sleepOnly.woke() == "pd", "wake without a locked session must release the notice")
     }
 
     private static func testHabitDayStates() throws {
