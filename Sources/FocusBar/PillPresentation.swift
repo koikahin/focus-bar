@@ -43,12 +43,12 @@ final class PillRenderer {
     private(set) var renderedState: PillState?
     private(set) var hoverText = ""
 
-    init(statusItem: NSStatusItem) {
+    init(statusItem: NSStatusItem, elapsedSnapshot: @escaping @MainActor () -> String? = { nil }) {
         self.statusItem = statusItem
         guard let button = statusItem.button else { preconditionFailure("Missing status bar button") }
         button.isBordered = false
         button.title = ""
-        hover = PillHover(button: button)
+        hover = PillHover(button: button, elapsedSnapshot: elapsedSnapshot)
 
         outline = CompletedOutlineView(frame: .zero)
         outline.autoresizingMask = [.width, .height]

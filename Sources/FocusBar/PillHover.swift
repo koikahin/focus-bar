@@ -10,9 +10,12 @@ final class PillHover: NSResponder {
     private let label = NSTextField(wrappingLabelWithString: "")
     private var text = ""
     private var isHovered = false
+    private let elapsedSnapshot: @MainActor () -> String?
+    private var elapsedAtPresentation: String?
 
-    init(button: NSStatusBarButton) {
+    init(button: NSStatusBarButton, elapsedSnapshot: @escaping @MainActor () -> String? = { nil }) {
         self.button = button
+        self.elapsedSnapshot = elapsedSnapshot
         super.init()
         button.addTrackingArea(NSTrackingArea(rect: .zero,
             options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
@@ -41,12 +44,19 @@ final class PillHover: NSResponder {
         hoverTimer?.invalidate()
         hoverTimer = nil
         panel?.orderOut(nil)
+        elapsedAtPresentation = nil
     }
 
     @objc private func present() {
         hoverTimer = nil
         guard isHovered, !text.isEmpty, let button, let window = button.window, window.isVisible else { return }
         guard let screen = window.screen else { preconditionFailure("Visible status button has no screen") }
+        if panel?.isVisible != true { elapsedAtPresentation = elapsedSnapshot() }
+        var displayText = text
+        if let elapsedAtPresentation {
+            let endOfHeader = displayText.firstIndex(of: "\n") ?? displayText.endIndex
+            displayText.insert(contentsOf: " · Today \(elapsedAtPresentation)", at: endOfHeader)
+        }
         let panel: NSPanel
         if let existing = self.panel {
             panel = existing
@@ -71,7 +81,7 @@ final class PillHover: NSResponder {
             self.panel = panel
         }
         panel.appearance = button.effectiveAppearance
-        let content = NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.labelColor])
+        let content = NSAttributedString(string: displayText, attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.labelColor])
         label.attributedStringValue = content
         label.preferredMaxLayoutWidth = 320
         let bounds = content.boundingRect(with: NSSize(width: 320, height: CGFloat.greatestFiniteMagnitude), options: [.usesLineFragmentOrigin, .usesFontLeading])

@@ -123,7 +123,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
         button.target = self
         button.action = #selector(statusItemPressed(_:))
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-        pillRenderer = PillRenderer(statusItem: statusItem)
+        pillRenderer = PillRenderer(statusItem: statusItem, elapsedSnapshot: { [weak self] in
+            guard let self, let task = self.store.currentTask else { return nil }
+            return self.store.formattedElapsed(for: task)
+        })
         store.onChange = { [weak self] in self?.scheduler.requestRefresh() }
         store.onBackupFailure = { [weak self] message in self?.presentBackupFailure(message) }
         if let message = store.backupFailure { presentBackupFailure(message) }

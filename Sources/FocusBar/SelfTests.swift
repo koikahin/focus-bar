@@ -47,7 +47,8 @@ enum FocusSelfTests {
             try testThirtyMinuteRefreshWithoutPolling()
             try testCompletionNotificationStreaks()
             try testPillHoverPresentation()
-            print("FocusBar self-tests passed (27/27)")
+            try testPillHoverElapsedSnapshot()
+            print("FocusBar self-tests passed (28/28)")
             return true
         } catch {
             FileHandle.standardError.write(Data("FocusBar self-test failed: \(error)\n".utf8))
@@ -402,6 +403,61 @@ enum FocusSelfTests {
         try expect(!hoverWindows().isEmpty, "hover details must work again after leaving and returning")
         renderer.dismissHover()
         try expect(hoverWindows().isEmpty, "a pill action or interruption must be able to dismiss the hover panel immediately")
+    }
+
+    private static func testPillHoverElapsedSnapshot() throws {
+        let clock = SelfTestClock(localDate(year: 2026, month: 9, day: 9, hour: 10))
+        let store = makeStore(clock: clock)
+        let work = store.tasks[0]
+        store.setElapsed(for: work, to: 3_661)
+        store.start(taskID: work.id)
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        defer { NSStatusBar.system.removeStatusItem(item) }
+        var captures = 0
+        let renderer = PillRenderer(statusItem: item, elapsedSnapshot: {
+            captures += 1
+            return store.formattedElapsed(for: work)
+        })
+        defer { renderer.dismissHover() }
+        func render() {
+            let streaks = store.streaks(for: work)
+            renderer.render(PillState(title: work.name, isTracking: store.activeTaskID == work.id,
+                                      elapsed: store.elapsed(for: work), target: work.targetSeconds, streaks: streaks), streaks: streaks)
+        }
+        render()
+        let image = item.button?.image
+        try expect(captures == 0, "ordinary pill rendering must not compute an elapsed snapshot")
+        guard let button = item.button,
+              let area = button.trackingAreas.first(where: { $0.owner is PillHover }),
+              let owner = area.owner as? NSResponder else { throw Failure(description: "missing hover presenter") }
+        func event(_ type: NSEvent.EventType) -> NSEvent {
+            NSEvent.enterExitEvent(with: type, location: NSPoint(x: button.bounds.midX, y: button.bounds.midY),
+                                  modifierFlags: [], timestamp: 0, windowNumber: button.window!.windowNumber,
+                                  context: nil, eventNumber: 1, trackingNumber: 0, userData: nil)!
+        }
+        func contains(_ expected: String, in view: NSView) -> Bool {
+            if let field = view as? NSTextField, field.stringValue.contains(expected) { return true }
+            return view.subviews.contains { contains(expected, in: $0) }
+        }
+        func isVisible(_ expected: String) -> Bool {
+            NSApp.windows.contains { $0.isVisible && $0.contentView.map { contains(expected, in: $0) } == true }
+        }
+        clock.now = clock.now.addingTimeInterval(4)
+        owner.mouseEntered(with: event(.mouseEntered))
+        RunLoop.main.run(until: Date.now.addingTimeInterval(0.5))
+        try expect(isVisible("work · Tracking · Today 1:01:05"), "tracking hover must capture elapsed time when the panel opens, rather than when the pill was last rendered")
+        try expect(captures == 1, "opening hover must capture elapsed time exactly once")
+        clock.now = clock.now.addingTimeInterval(10)
+        render()
+        RunLoop.main.run(until: Date.now.addingTimeInterval(0.05))
+        try expect(isVisible("Today 1:01:05") && captures == 1, "elapsed time must remain a fixed snapshot while hovering, even if a visible display refreshes")
+        try expect(item.button?.image === image, "hover elapsed time must not redraw the pill")
+        owner.mouseExited(with: event(.mouseExited))
+        store.finishCurrentSession()
+        render()
+        owner.mouseEntered(with: event(.mouseEntered))
+        RunLoop.main.run(until: Date.now.addingTimeInterval(0.5))
+        try expect(isVisible("work · Stopped · Today 1:01:15") && captures == 2, "a new stopped hover must show a fresh snapshot of the current focus-day total")
     }
 
     private static func testThirtyMinuteRefreshWithoutPolling() throws {

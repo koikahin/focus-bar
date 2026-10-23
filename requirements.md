@@ -34,6 +34,7 @@ FocusBar is a native macOS menu-bar app for tracking focused time against a smal
 - The appearance must remain readable in both macOS light and dark modes.
 - Hovering over the pill shows the selected area's tracking/completion state and both its daily-target and 30-minute streaks. Refresh the hover text when either streak changes without redrawing an otherwise unchanged pill.
 - Present the hover details in a native, nonactivating tooltip-style panel after a brief hover, using tracking that remains active while FocusBar is in the background. Dismiss it on pointer exit, pill clicks, system interruption, and quit. Hover must never start tracking, open the management window, or activate FocusBar.
+- Beside `Stopped` or `Tracking`, include the selected area's current focus-day elapsed time as `Today H:MM:SS`. Capture it once when the hover panel actually opens, retain that snapshot while the panel remains open, and take a fresh value on the next hover. Do not add a recurring timer or per-second refresh for this time.
 
 ## Right-click status menu
 
