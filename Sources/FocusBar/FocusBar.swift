@@ -4,6 +4,10 @@ import Observation
 import SwiftUI
 import UserNotifications
 
+// Use the property-wrapper type explicitly: newer SDKs also export a State
+// macro whose plugin is unavailable in standalone Command Line Tools.
+private typealias ViewState<Value> = SwiftUI.State<Value>
+
 @main
 @MainActor
 struct FocusBarMain {
@@ -12,6 +16,26 @@ struct FocusBarMain {
     private static let appDelegate = AppDelegate()
 
     static func main() {
+        if CommandLine.arguments.contains("--check-notifications") {
+            let center = UNUserNotificationCenter.current()
+            center.getNotificationSettings { settings in
+                print("Authorization: \(settings.authorizationStatus.rawValue)")
+                print("Alerts: \(settings.alertSetting.rawValue)")
+                print("Alert style: \(settings.alertStyle.rawValue)")
+                print("Sounds: \(settings.soundSetting.rawValue)")
+                exit(settings.authorizationStatus == .authorized && settings.alertSetting == .enabled && settings.alertStyle != .none ? 0 : 1)
+            }
+            RunLoop.main.run()
+            return
+        }
+        if CommandLine.arguments.contains("--test-notification") {
+            FocusNotificationProbe.run()
+            return
+        }
+        if CommandLine.arguments.contains("--render-test") {
+            guard PillRenderTests.run() else { exit(1) }
+            return
+        }
         if CommandLine.arguments.contains("--self-test") {
             guard FocusSelfTests.run() else { exit(1) }
             return
@@ -41,11 +65,6 @@ struct FocusBarMain {
             RunLoop.current.run(until: Date.now.addingTimeInterval(0.05))
         }
     }
-}
-
-@MainActor
-private final class PillContentLabel: NSTextField {
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 struct SystemInterruptionState {
@@ -86,46 +105,28 @@ struct SystemInterruptionState {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcurrency UNUserNotificationCenterDelegate {
     private let store = FocusStore()
     private var statusItem: NSStatusItem!
-    private var pillLabel: PillContentLabel!
-    private var ticker: Timer?
+    private var pillRenderer: PillRenderer!
+    private lazy var scheduler = FocusScheduler(store: store) { [weak self] in
+        self?.updateStatusItem()
+        self?.updateOpenMenu()
+    }
     private var openMenuTaskItems: [UUID: NSMenuItem] = [:]
     private var settingsWindow: NSWindow?
+    private var isMenuOpen = false
     private var systemInterruption = SystemInterruptionState()
+    private let notifications = FocusNotifications(onFailure: FocusFailure.present)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        guard let button = statusItem.button else { return }
+        guard let button = statusItem.button else { preconditionFailure("macOS did not create the FocusBar status button") }
 
         button.target = self
         button.action = #selector(statusItemPressed(_:))
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-        button.isBordered = false
-        button.title = ""
-        button.image = nil
-        button.wantsLayer = true
-        button.layer?.cornerRadius = 10
-        button.layer?.borderWidth = 0.5
-        button.layer?.borderColor = NSColor.black.withAlphaComponent(0.10).cgColor
-
-        let label = PillContentLabel(frame: .zero)
-        label.isEditable = false
-        label.isSelectable = false
-        label.isBordered = false
-        label.drawsBackground = false
-        label.usesSingleLineMode = true
-        label.lineBreakMode = .byClipping
-        label.translatesAutoresizingMaskIntoConstraints = false
-        button.addSubview(label)
-        NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: button.centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: button.centerYAnchor)
-        ])
-        pillLabel = label
-
-        updateStatusItem()
-        let ticker = Timer(timeInterval: 1, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
-        RunLoop.main.add(ticker, forMode: .common)
-        self.ticker = ticker
+        pillRenderer = PillRenderer(statusItem: statusItem)
+        store.onChange = { [weak self] in self?.scheduler.requestRefresh() }
+        store.onBackupFailure = { [weak self] message in self?.presentBackupFailure(message) }
+        if let message = store.backupFailure { presentBackupFailure(message) }
         let workspaceNotifications = NSWorkspace.shared.notificationCenter
         workspaceNotifications.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
         workspaceNotifications.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
@@ -135,28 +136,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
         distributedNotifications.addObserver(self, selector: #selector(sessionDidResignActive), name: .init("com.apple.screenIsLocked"), object: nil)
         distributedNotifications.addObserver(self, selector: #selector(sessionDidBecomeActive), name: .init("com.apple.screenIsUnlocked"), object: nil)
 
-        let notifications = UNUserNotificationCenter.current()
-        notifications.delegate = self
-        notifications.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        UNUserNotificationCenter.current().delegate = self
+        notifications.start()
         store.onTaskCompleted = { [weak self] task, dayKey in
-            self?.deliverNotification(
+            guard let self else { return }
+            self.deliverNotification(
                 identifier: "focusbar.\(task.id.uuidString).\(dayKey)",
                 title: "Daily target complete",
-                body: "You reached your daily \(task.name) target."
+                body: self.store.completionNotificationBody(for: task, dayKey: dayKey)
             )
         }
+        NotificationCenter.default.addObserver(self, selector: #selector(clockDidChange), name: NSNotification.Name.NSSystemClockDidChange, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(clockDidChange), name: NSNotification.Name.NSSystemTimeZoneDidChange, object: nil)
+        scheduler.refresh()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        pillRenderer.dismissHover()
+        store.onChange = nil
+        scheduler.stop()
         store.finishCurrentSession()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         DistributedNotificationCenter.default().removeObserver(self)
+        NotificationCenter.default.removeObserver(self)
     }
 
-    @objc private func tick() {
-        store.pulse()
-        updateStatusItem()
-        updateOpenMenu()
+    @objc private func clockDidChange() { scheduler.refresh() }
+
+    private func presentBackupFailure(_ message: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.store.backupFailure == message else { return }
+            let alert = NSAlert()
+            alert.messageText = "Daily reset postponed"
+            alert.informativeText = message
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Retry")
+            alert.addButton(withTitle: "Later")
+            if alert.runModal() == .alertFirstButtonReturn {
+                self.store.refreshDayIfNeeded()
+                self.scheduler.refresh()
+                if let failure = self.store.backupFailure { self.presentBackupFailure(failure) }
+            }
+        }
     }
 
     @objc private func willSleep() {
@@ -167,8 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
     @objc private func didWake() {
         store.refreshDayIfNeeded()
         presentStoppedTimerNotice(for: systemInterruption.woke())
-        updateStatusItem()
-        updateOpenMenu()
+        scheduler.refresh()
     }
 
     @objc private func sessionDidResignActive() {
@@ -179,16 +199,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
     @objc private func sessionDidBecomeActive() {
         store.refreshDayIfNeeded()
         presentStoppedTimerNotice(for: systemInterruption.sessionBecameActive())
-        updateStatusItem()
-        updateOpenMenu()
+        scheduler.refresh()
     }
 
     private func stopTimerForSystemInterruption() {
+        pillRenderer.dismissHover()
         if let stoppedTask = store.stopForSystemInterruption() {
             systemInterruption.recordStoppedTask(stoppedTask.name)
         }
-        updateStatusItem()
-        updateOpenMenu()
+        scheduler.refresh()
     }
 
     private func presentStoppedTimerNotice(for taskName: String?) {
@@ -201,15 +220,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
     }
 
     private func deliverNotification(identifier: String, title: String, body: String) {
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        content.sound = .default
-        UNUserNotificationCenter.current().add(UNNotificationRequest(
-            identifier: identifier,
-            content: content,
-            trigger: nil
-        ))
+        notifications.deliver(identifier: identifier, title: title, body: body)
     }
 
     func userNotificationCenter(
@@ -217,10 +228,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        completionHandler([.banner, .sound])
+        completionHandler([.banner, .list, .sound])
     }
 
     @objc private func statusItemPressed(_ sender: NSStatusBarButton) {
+        pillRenderer.dismissHover()
         if NSApp.currentEvent?.type == .rightMouseUp {
             showMenu()
         } else {
@@ -230,59 +242,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
     }
 
     private func updateStatusItem() {
-        guard let button = statusItem.button else { return }
         let task = store.currentTask
-        let title = task?.name ?? "focus"
-        let isTracking = store.activeTaskID != nil
-        let isComplete = task.map { store.elapsed(for: $0) >= $0.targetSeconds } ?? false
-
-        let completeColor = NSColor.systemGreen
-        if isTracking {
-            let marker = "●"
-            let titleColor = NSColor(srgbRed: 0.12, green: 0.12, blue: 0.14, alpha: 1)
-            let markerColor: NSColor = isComplete ? completeColor : .systemRed
-            let markerAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: markerColor, .font: NSFont.systemFont(ofSize: 10, weight: .bold)]
-            let titleAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: titleColor, .font: NSFont.systemFont(ofSize: 12, weight: .semibold)]
-            let pillText = PillLayout.text(title: title, marker: marker)
-            let rendered = NSMutableAttributedString(string: pillText, attributes: titleAttributes)
-            let markerRange = (pillText as NSString).range(of: marker, options: .backwards)
-            rendered.addAttributes(markerAttributes, range: markerRange)
-
-            button.image = nil
-            button.imagePosition = .noImage
-            button.contentTintColor = nil
-            pillLabel.isHidden = false
-            pillLabel.attributedStringValue = rendered
-            pillLabel.invalidateIntrinsicContentSize()
-            button.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.96).cgColor
-            button.layer?.borderWidth = 0.5
-            button.layer?.borderColor = NSColor.black.withAlphaComponent(0.10).cgColor
-            statusItem.length = PillLayout.width(forContentWidth: rendered.size().width)
-        } else if isComplete {
-            let image = PillLayout.idleTemplateImage(title: title, drawsOutline: false)
-            pillLabel.isHidden = true
-            button.image = image
-            button.imagePosition = .imageOnly
-            button.imageScaling = .scaleNone
-            button.contentTintColor = nil
-            button.layer?.backgroundColor = NSColor.clear.cgColor
-            button.layer?.borderWidth = 1
-            button.layer?.borderColor = completeColor.cgColor
-            statusItem.length = image.size.width
-        } else {
-            let image = PillLayout.idleTemplateImage(title: title)
-            pillLabel.isHidden = true
-            button.image = image
-            button.imagePosition = .imageOnly
-            button.imageScaling = .scaleNone
-            button.contentTintColor = nil
-            button.layer?.backgroundColor = NSColor.clear.cgColor
-            button.layer?.borderWidth = 0
-            statusItem.length = image.size.width
-        }
-        button.needsLayout = true
-        button.layoutSubtreeIfNeeded()
-        button.toolTip = task.map { "\($0.name): \(store.formattedElapsed(for: $0)) today" } ?? "Choose a focus area"
+        let streaks = task.map { store.streaks(for: $0) }
+        pillRenderer.render(PillState(
+            title: task?.name ?? "focus",
+            isTracking: store.activeTaskID != nil,
+            elapsed: task.map { store.elapsed(for: $0) } ?? 0,
+            target: task?.targetSeconds,
+            streaks: streaks
+        ), streaks: streaks)
     }
 
     private func showMenu() {
@@ -326,10 +294,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
         let quit = NSMenuItem(title: "Quit FocusBar", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
+        isMenuOpen = true
+        updateSecondsDisplayVisibility()
         statusItem.menu = menu
         statusItem.button?.performClick(nil)
         statusItem.menu = nil
         openMenuTaskItems.removeAll()
+        isMenuOpen = false
+        updateSecondsDisplayVisibility()
     }
 
     private func updateOpenMenu() {
@@ -338,11 +310,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
             guard let item = openMenuTaskItems[task.id] else { continue }
             let elapsed = store.formattedElapsed(for: task)
             let target = store.formatted(targetSeconds: task.targetSeconds)
-            item.title = "\(task.name)    \(elapsed) / \(target)"
-            item.state = store.activeTaskID == task.id ? .on : .off
-            item.image = store.elapsed(for: task) >= task.targetSeconds
-                ? NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: "Complete")
-                : nil
+            let title = "\(task.name)    \(elapsed) / \(target)"
+            if item.title != title { item.title = title }
+            let state: NSControl.StateValue = store.activeTaskID == task.id ? .on : .off
+            if item.state != state { item.state = state }
+            let isComplete = store.elapsed(for: task) >= task.targetSeconds
+            if isComplete != (item.image != nil) {
+                item.image = isComplete
+                    ? NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: "Complete")
+                    : nil
+            }
         }
     }
 
@@ -357,6 +334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
             NSApp.setActivationPolicy(.regular)
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
+            updateSecondsDisplayVisibility()
             return
         }
 
@@ -376,414 +354,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @pre
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow = window
+        updateSecondsDisplayVisibility()
     }
 
     func windowWillClose(_ notification: Notification) {
         guard notification.object as? NSWindow === settingsWindow else { return }
         settingsWindow = nil
         NSApp.setActivationPolicy(.accessory)
+        updateSecondsDisplayVisibility()
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) { updateSecondsDisplayVisibility() }
+    func windowDidDeminiaturize(_ notification: Notification) { updateSecondsDisplayVisibility() }
+    func windowDidChangeOcclusionState(_ notification: Notification) { updateSecondsDisplayVisibility() }
+
+    private func updateSecondsDisplayVisibility() {
+        let windowVisible = settingsWindow.map {
+            $0.isVisible && !$0.isMiniaturized && $0.occlusionState.contains(.visible)
+        } ?? false
+        scheduler.setSecondsDisplayVisible(isMenuOpen || windowVisible)
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
 }
 
-enum PillLayout {
-    static let horizontalInset: CGFloat = 12
-    static let height: CGFloat = 20
 
-    static func text(title: String, marker: String) -> String {
-        marker.isEmpty ? title : "\(title)  \(marker)"
-    }
-
-    static func width(forContentWidth contentWidth: CGFloat) -> CGFloat {
-        ceil(contentWidth) + (horizontalInset * 2)
-    }
-
-    static func idleTemplateImage(title: String, drawsOutline: Bool = true) -> NSImage {
-        let attributes: [NSAttributedString.Key: Any] = [
-            .foregroundColor: NSColor.black,
-            .font: NSFont.systemFont(ofSize: 12, weight: .semibold)
-        ]
-        let text = NSAttributedString(string: title, attributes: attributes)
-        let size = NSSize(width: width(forContentWidth: text.size().width), height: height)
-        let image = NSImage(size: size, flipped: false) { rect in
-            if drawsOutline {
-                NSColor.black.setStroke()
-                let outline = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 9.5, yRadius: 9.5)
-                outline.lineWidth = 1
-                outline.stroke()
-            }
-            let textSize = text.size()
-            text.draw(at: NSPoint(
-                x: floor((rect.width - textSize.width) / 2),
-                y: floor((rect.height - textSize.height) / 2)
-            ))
-            return true
-        }
-        image.isTemplate = true
-        return image
-    }
-}
-
-struct FocusTask: Codable, Identifiable, Equatable {
-    var id = UUID()
-    var name: String
-    var targetSeconds: TimeInterval
-}
-
-private struct FocusSnapshot: Codable {
-    var tasks: [FocusTask]
-    var totals: [UUID: TimeInterval]
-    var dayKey: String
-    var activeTaskID: UUID?
-    var activeStartedAt: Date?
-    var currentTaskID: UUID?
-    var completionHistory: [UUID: Set<String>]?
-    var dailyElapsedHistory: [UUID: [String: TimeInterval]]?
-    var dailyTargetHistory: [UUID: [String: TimeInterval]]?
-}
-
-enum CompletionDayStatus {
-    case none
-    case partial
-    case complete
-}
-
-struct CompletionDay: Identifiable {
-    let id: String
-    let date: Date
-    let elapsedSeconds: TimeInterval
-    let targetSeconds: TimeInterval
-    let recordedAsComplete: Bool
-
-    var status: CompletionDayStatus {
-        if recordedAsComplete || elapsedSeconds >= targetSeconds { return .complete }
-        if elapsedSeconds > 60 { return .partial }
-        return .none
-    }
-
-    var isComplete: Bool { status == .complete }
-}
-
-@MainActor @Observable
-final class FocusStore {
-    private let defaultsKey = "focusbar.snapshot.v1"
-    @ObservationIgnored private let defaults: UserDefaults
-    @ObservationIgnored private let clock: () -> Date
-    @ObservationIgnored var onTaskCompleted: ((FocusTask, String) -> Void)?
-
-    var tasks: [FocusTask] = []
-    var totals: [UUID: TimeInterval] = [:]
-    var completionHistory: [UUID: Set<String>] = [:]
-    var dailyElapsedHistory: [UUID: [String: TimeInterval]] = [:]
-    var dailyTargetHistory: [UUID: [String: TimeInterval]] = [:]
-    var activeTaskID: UUID?
-    var activeStartedAt: Date?
-    var currentTaskID: UUID?
-    var now: Date
-    private var dayKey: String
-
-    var currentTask: FocusTask? {
-        guard let id = activeTaskID ?? currentTaskID else { return tasks.first }
-        return tasks.first(where: { $0.id == id })
-    }
-
-    init(defaults: UserDefaults = .standard, clock: @escaping () -> Date = { Date.now }) {
-        self.defaults = defaults
-        self.clock = clock
-        let initialNow = clock()
-        now = initialNow
-        dayKey = Self.focusDayKey(for: initialNow)
-        load()
-        refreshDayIfNeeded(at: initialNow)
-    }
-
-    func pulse() {
-        refreshDayIfNeeded(at: clock())
-        evaluateCompletions()
-    }
-
-    func refreshDayIfNeeded() {
-        refreshDayIfNeeded(at: clock())
-    }
-
-    private func refreshDayIfNeeded(at timestamp: Date) {
-        now = timestamp
-        let key = Self.focusDayKey(for: timestamp)
-        guard key != dayKey else { return }
-
-        // Close the old daily ledger precisely at 6 AM before starting the new
-        // one. This is evaluated on the first pulse after wake, so it does not
-        // depend on a timer firing while the Mac is asleep.
-        let newFocusDayStart = Self.focusDayStart(for: timestamp)
-        if let id = activeTaskID, let started = activeStartedAt {
-            totals[id, default: 0] += max(0, newFocusDayStart.timeIntervalSince(started))
-        }
-        recordDailyHistory(for: dayKey, totals: totals)
-        recordCompletions(for: dayKey, totals: totals)
-        dayKey = key
-        totals = [:]
-        activeStartedAt = activeTaskID == nil ? nil : newFocusDayStart
-        save()
-    }
-
-    func elapsed(for task: FocusTask) -> TimeInterval {
-        var value = totals[task.id, default: 0]
-        if activeTaskID == task.id, let started = activeStartedAt {
-            value += max(0, now.timeIntervalSince(started))
-        }
-        return value
-    }
-
-    func formattedElapsed(for task: FocusTask) -> String {
-        formatted(seconds: elapsed(for: task))
-    }
-
-    func formatted(targetSeconds: TimeInterval) -> String { DurationInput.display(targetSeconds) }
-
-    func start(taskID: UUID) {
-        guard tasks.contains(where: { $0.id == taskID }) else { return }
-        let timestamp = clock()
-        refreshDayIfNeeded(at: timestamp)
-        finishCurrentSession(at: timestamp)
-        currentTaskID = taskID
-        activeTaskID = taskID
-        activeStartedAt = timestamp
-        save()
-    }
-
-    /// Selecting an area is deliberately not a start action. This lets the
-    /// user choose their next focus without accidentally recording time.
-    func select(taskID: UUID) {
-        guard tasks.contains(where: { $0.id == taskID }) else { return }
-        let timestamp = clock()
-        refreshDayIfNeeded(at: timestamp)
-        finishCurrentSession(at: timestamp)
-        currentTaskID = taskID
-        save()
-    }
-
-    func toggleCurrentTask() {
-        refreshDayIfNeeded()
-        if activeTaskID != nil {
-            finishCurrentSession()
-        } else if let task = currentTask ?? tasks.first {
-            start(taskID: task.id)
-        }
-    }
-
-    func finishCurrentSession() {
-        let timestamp = clock()
-        refreshDayIfNeeded(at: timestamp)
-        finishCurrentSession(at: timestamp)
-    }
-
-    private func finishCurrentSession(at timestamp: Date) {
-        guard let id = activeTaskID, let started = activeStartedAt else { return }
-        totals[id, default: 0] += max(0, timestamp.timeIntervalSince(started))
-        activeTaskID = nil
-        activeStartedAt = nil
-        evaluateCompletions()
-        save()
-    }
-
-    func stopForSystemInterruption() -> FocusTask? {
-        let timestamp = clock()
-        refreshDayIfNeeded(at: timestamp)
-        guard let id = activeTaskID,
-              let task = tasks.first(where: { $0.id == id }) else { return nil }
-        finishCurrentSession(at: timestamp)
-        return task
-    }
-
-    func setElapsed(for task: FocusTask, to seconds: TimeInterval) {
-        let timestamp = clock()
-        refreshDayIfNeeded(at: timestamp)
-        guard tasks.contains(where: { $0.id == task.id }) else { return }
-        totals[task.id] = max(0, seconds)
-        if activeTaskID == task.id { activeStartedAt = timestamp }
-        synchronizeTodayCompletion(for: task)
-        save()
-    }
-
-    func resetElapsed(for task: FocusTask) {
-        setElapsed(for: task, to: 0)
-    }
-
-    func addTask(name: String, targetSeconds: TimeInterval) {
-        let cleaned = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleaned.isEmpty else { return }
-        let task = FocusTask(name: cleaned, targetSeconds: max(1, targetSeconds))
-        tasks.append(task)
-        currentTaskID = currentTaskID ?? task.id
-        save()
-    }
-
-    func update(_ task: FocusTask, name: String, targetSeconds: TimeInterval) {
-        guard let index = tasks.firstIndex(where: { $0.id == task.id }) else { return }
-        let cleaned = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleaned.isEmpty else { return }
-        tasks[index].name = cleaned
-        tasks[index].targetSeconds = max(1, targetSeconds)
-        synchronizeTodayCompletion(for: tasks[index])
-        save()
-    }
-
-    func remove(_ task: FocusTask) {
-        if activeTaskID == task.id { finishCurrentSession() }
-        tasks.removeAll { $0.id == task.id }
-        totals[task.id] = nil
-        completionHistory[task.id] = nil
-        dailyElapsedHistory[task.id] = nil
-        dailyTargetHistory[task.id] = nil
-        if currentTaskID == task.id { currentTaskID = tasks.first?.id }
-        save()
-    }
-
-    func recentCompletions(for task: FocusTask, count: Int = 10) -> [CompletionDay] {
-        let calendar = Calendar.current
-        let currentStart = Self.focusDayStart(for: now)
-        return (0..<count).reversed().compactMap { offset in
-            guard let date = calendar.date(byAdding: .day, value: -offset, to: currentStart) else { return nil }
-            let key = Self.focusDayKey(for: date)
-            let isCurrentDay = key == dayKey
-            let elapsedSeconds = isCurrentDay
-                ? elapsed(for: task)
-                : dailyElapsedHistory[task.id]?[key, default: 0] ?? 0
-            let targetSeconds = isCurrentDay
-                ? task.targetSeconds
-                : dailyTargetHistory[task.id]?[key] ?? task.targetSeconds
-            return CompletionDay(
-                id: key,
-                date: date,
-                elapsedSeconds: elapsedSeconds,
-                targetSeconds: targetSeconds,
-                recordedAsComplete: completionHistory[task.id]?.contains(key) == true
-            )
-        }
-    }
-
-    func completionStreak(for task: FocusTask) -> Int {
-        let calendar = Calendar.current
-        let history = completionHistory[task.id, default: []]
-        var date = Self.focusDayStart(for: now)
-        if !history.contains(Self.focusDayKey(for: date)) {
-            date = calendar.date(byAdding: .day, value: -1, to: date) ?? date
-        }
-
-        var streak = 0
-        while history.contains(Self.focusDayKey(for: date)) {
-            streak += 1
-            guard let previous = calendar.date(byAdding: .day, value: -1, to: date) else { break }
-            date = previous
-        }
-        return streak
-    }
-
-    private func synchronizeTodayCompletion(for task: FocusTask) {
-        if elapsed(for: task) >= task.targetSeconds {
-            recordCompletion(for: task, dayKey: dayKey)
-        } else {
-            completionHistory[task.id]?.remove(dayKey)
-        }
-    }
-
-    private func evaluateCompletions() {
-        for task in tasks where elapsed(for: task) >= task.targetSeconds {
-            recordCompletion(for: task, dayKey: dayKey)
-        }
-    }
-
-    private func recordCompletions(for completedDayKey: String, totals: [UUID: TimeInterval]) {
-        for task in tasks where totals[task.id, default: 0] >= task.targetSeconds {
-            recordCompletion(for: task, dayKey: completedDayKey)
-        }
-    }
-
-    private func recordDailyHistory(for completedDayKey: String, totals: [UUID: TimeInterval]) {
-        for task in tasks {
-            dailyElapsedHistory[task.id, default: [:]][completedDayKey] = max(0, totals[task.id, default: 0])
-            dailyTargetHistory[task.id, default: [:]][completedDayKey] = task.targetSeconds
-        }
-    }
-
-    private func recordCompletion(for task: FocusTask, dayKey completedDayKey: String) {
-        let inserted = completionHistory[task.id, default: []].insert(completedDayKey).inserted
-        if inserted {
-            save()
-            onTaskCompleted?(task, completedDayKey)
-        }
-    }
-
-    private func formatted(seconds: TimeInterval) -> String {
-        let rounded = Int(seconds.rounded(.down))
-        let hours = rounded / 3600
-        let minutes = (rounded % 3600) / 60
-        let seconds = rounded % 60
-        return String(format: "%d:%02d:%02d", hours, minutes, seconds)
-    }
-
-    private func load() {
-        guard let data = defaults.data(forKey: defaultsKey),
-              let snapshot = try? JSONDecoder().decode(FocusSnapshot.self, from: data) else {
-            tasks = [
-                FocusTask(name: "work", targetSeconds: 4 * 60 * 60),
-                FocusTask(name: "pd", targetSeconds: 60 * 60)
-            ]
-            currentTaskID = tasks.first?.id
-            return
-        }
-        tasks = snapshot.tasks
-        totals = snapshot.totals
-        dayKey = snapshot.dayKey
-        activeTaskID = snapshot.activeTaskID
-        activeStartedAt = snapshot.activeStartedAt
-        currentTaskID = snapshot.currentTaskID
-        completionHistory = snapshot.completionHistory ?? [:]
-        dailyElapsedHistory = snapshot.dailyElapsedHistory ?? [:]
-        dailyTargetHistory = snapshot.dailyTargetHistory ?? [:]
-
-        // Older snapshots only knew whether a day was complete. Preserve
-        // those green days by treating the target as the minimum known total;
-        // exact elapsed and target history is recorded from this version on.
-        for task in tasks {
-            for completedDayKey in completionHistory[task.id, default: []] {
-                if dailyElapsedHistory[task.id]?[completedDayKey] == nil {
-                    dailyElapsedHistory[task.id, default: [:]][completedDayKey] = task.targetSeconds
-                }
-                if dailyTargetHistory[task.id]?[completedDayKey] == nil {
-                    dailyTargetHistory[task.id, default: [:]][completedDayKey] = task.targetSeconds
-                }
-            }
-        }
-    }
-
-    private func save() {
-        let snapshot = FocusSnapshot(
-            tasks: tasks,
-            totals: totals,
-            dayKey: dayKey,
-            activeTaskID: activeTaskID,
-            activeStartedAt: activeStartedAt,
-            currentTaskID: currentTaskID,
-            completionHistory: completionHistory,
-            dailyElapsedHistory: dailyElapsedHistory,
-            dailyTargetHistory: dailyTargetHistory
-        )
-        guard let data = try? JSONEncoder().encode(snapshot) else { return }
-        defaults.set(data, forKey: defaultsKey)
-    }
-
-    private static func focusDayKey(for date: Date) -> String {
-        ISO8601DateFormatter().string(from: focusDayStart(for: date))
-    }
-
-    private static func focusDayStart(for date: Date) -> Date {
-        let calendar = Calendar.current
-        let shifted = calendar.date(byAdding: .hour, value: -6, to: date) ?? date
-        return calendar.date(byAdding: .hour, value: 6, to: calendar.startOfDay(for: shifted)) ?? date
-    }
-}
 
 enum DurationInput {
     static func display(_ seconds: TimeInterval) -> String {
@@ -807,39 +402,38 @@ enum ElapsedInput {
     static func seconds(from input: String) -> TimeInterval? {
         let fields = input.trimmingCharacters(in: .whitespacesAndNewlines)
             .split(separator: ":", omittingEmptySubsequences: false)
-        guard fields.count == 2 || fields.count == 3,
-              let hours = Int(fields[0]), let minutes = Int(fields[1]),
-              hours >= 0, (0..<60).contains(minutes) else { return nil }
-        let seconds = fields.count == 3 ? Int(fields[2]) : 0
-        guard let seconds, (0..<60).contains(seconds) else { return nil }
-        return TimeInterval(hours * 3_600 + minutes * 60 + seconds)
+        guard fields.count <= 3 else { return nil }
+        let values = fields.map { $0.isEmpty ? 0 : Int($0) }
+        guard let hours = values[0], hours >= 0 else { return nil }
+        let minutes = values.count > 1 ? values[1] : 0
+        let seconds = values.count > 2 ? values[2] : 0
+        guard let minutes, let seconds,
+              (0..<60).contains(minutes), (0..<60).contains(seconds) else { return nil }
+        let total = TimeInterval(hours) * 3_600 + TimeInterval(minutes * 60 + seconds)
+        guard total < Double(Int.max) else { return nil }
+        return total
     }
 }
 
-private struct CommitOnBlurTextField: NSViewRepresentable {
+struct CommitOnBlurTextField: NSViewRepresentable {
     @Binding var text: String
     var onCommit: () -> Void
+    var onReset: () -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
-    func makeNSView(context: Context) -> NSTextField {
-        let field = NSTextField(string: text)
-        field.placeholderString = "H:MM or H:MM:SS"
-        field.alignment = .right
-        field.font = .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
-        field.usesSingleLineMode = true
-        field.delegate = context.coordinator
-        context.coordinator.textField = field
+    func makeNSView(context: Context) -> NSStackView {
+        let view = context.coordinator.makeEditorView()
         context.coordinator.activateAfterPresentation()
-        return field
+        return view
     }
 
-    func updateNSView(_ field: NSTextField, context: Context) {
+    func updateNSView(_ view: NSStackView, context: Context) {
         context.coordinator.parent = self
-        if field.stringValue != text { field.stringValue = text }
+        if let field = context.coordinator.textField, field.stringValue != text { field.stringValue = text }
     }
 
-    static func dismantleNSView(_ field: NSTextField, coordinator: Coordinator) {
+    static func dismantleNSView(_ view: NSStackView, coordinator: Coordinator) {
         coordinator.removeOutsideClickMonitor()
     }
 
@@ -847,11 +441,31 @@ private struct CommitOnBlurTextField: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextFieldDelegate {
         var parent: CommitOnBlurTextField
         weak var textField: NSTextField?
+        weak var resetButton: NSButton?
         private var outsideClickMonitor: Any?
         private var acceptsBlurCommit = false
+        private var isFinished = false
 
         init(parent: CommitOnBlurTextField) {
             self.parent = parent
+        }
+
+        func makeEditorView() -> NSStackView {
+            let field = NSTextField(string: parent.text)
+            field.placeholderString = "H[:MM[:SS]]"
+            field.alignment = .right
+            field.font = .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+            field.usesSingleLineMode = true
+            field.delegate = self
+            textField = field
+            let reset = NSButton(title: "Reset", target: self, action: #selector(resetCurrentValue))
+            reset.bezelStyle = .rounded
+            resetButton = reset
+            let view = NSStackView(views: [field, reset])
+            view.orientation = .horizontal
+            view.spacing = 8
+            field.widthAnchor.constraint(equalToConstant: 112).isActive = true
+            return view
         }
 
         func controlTextDidChange(_ notification: Notification) {
@@ -875,7 +489,7 @@ private struct CommitOnBlurTextField: NSViewRepresentable {
         func activateAfterPresentation() {
             acceptsBlurCommit = false
             DispatchQueue.main.async { [weak self] in
-                guard let self, let field = self.textField, let window = field.window else { return }
+                guard let self, !self.isFinished, let field = self.textField, let window = field.window else { return }
                 window.makeFirstResponder(field)
                 field.selectText(nil)
 
@@ -885,7 +499,7 @@ private struct CommitOnBlurTextField: NSViewRepresentable {
                 // intent. This prevents the opening click from closing the
                 // editor immediately.
                 DispatchQueue.main.async { [weak self] in
-                    guard let self, let field = self.textField, let window = field.window else { return }
+                    guard let self, !self.isFinished, let field = self.textField, let window = field.window else { return }
                     if window.firstResponder !== field.currentEditor() {
                         window.makeFirstResponder(field)
                         field.selectText(nil)
@@ -899,12 +513,24 @@ private struct CommitOnBlurTextField: NSViewRepresentable {
         func installOutsideClickMonitor() {
             guard outsideClickMonitor == nil else { return }
             outsideClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
-                guard let self, let field = self.textField, event.window === field.window else { return event }
-                let point = field.convert(event.locationInWindow, from: nil)
-                guard !field.bounds.contains(point) else { return event }
-                DispatchQueue.main.async { [weak self] in self?.commitCurrentValue() }
-                return event
+                guard let self else { return event }
+                return self.handleMouseDown(event)
             }
+        }
+
+        func handleMouseDown(_ event: NSEvent) -> NSEvent? {
+            guard let field = textField, event.window === field.window else { return event }
+            if event.type == .leftMouseDown, let resetButton,
+               resetButton.bounds.contains(resetButton.convert(event.locationInWindow, from: nil)) {
+                // Reset disappears when editing ends. Handle its mouse-down
+                // before a blur/outside commit can remove it before mouse-up.
+                resetCurrentValue()
+                return nil
+            }
+            let point = field.convert(event.locationInWindow, from: nil)
+            guard !field.bounds.contains(point) else { return event }
+            DispatchQueue.main.async { [weak self] in self?.commitCurrentValue() }
+            return event
         }
 
         func removeOutsideClickMonitor() {
@@ -914,9 +540,18 @@ private struct CommitOnBlurTextField: NSViewRepresentable {
         }
 
         private func commitCurrentValue() {
-            guard let textField else { return }
+            guard !isFinished, let textField else { return }
+            isFinished = true
+            removeOutsideClickMonitor()
             parent.text = textField.stringValue
             parent.onCommit()
+        }
+
+        @objc private func resetCurrentValue() {
+            guard !isFinished else { return }
+            isFinished = true
+            removeOutsideClickMonitor()
+            parent.onReset()
         }
     }
 }
@@ -925,18 +560,19 @@ struct SettingsView: View {
     @Bindable var store: FocusStore
     var onChange: () -> Void
     var onClose: () -> Void
-    @State private var adding = false
+    @ViewState private var adding = false
+    @ViewState private var pendingRemoval: [FocusTask] = []
+    @ViewState private var confirmingRemoval = false
 
     var body: some View {
         VStack(spacing: 0) {
             List {
                 Section("Daily focus areas") {
                     ForEach(store.tasks) { task in
-                        TaskEditor(task: task, store: store, onChange: onChange)
+                        TaskEditor(task: task, store: store, onChange: onChange, onRequestRemoval: { requestRemoval([task]) })
                     }
                     .onDelete { offsets in
-                        for index in offsets { store.remove(store.tasks[index]) }
-                        onChange()
+                        requestRemoval(offsets.map { store.tasks[$0] })
                     }
                 }
             }
@@ -956,6 +592,21 @@ struct SettingsView: View {
             AddTaskSheet(store: store, onChange: onChange)
         }
         .onExitCommand { onClose() }
+        .alert("Remove \(pendingRemoval.map(\.name).joined(separator: ", "))?", isPresented: $confirmingRemoval) {
+            Button("Remove Focus Area", role: .destructive) {
+                for task in pendingRemoval { store.remove(task) }
+                pendingRemoval = []
+                onChange()
+            }
+            Button("Cancel", role: .cancel) { pendingRemoval = [] }
+        } message: {
+            Text("Its recorded time and completion history will be removed.")
+        }
+    }
+
+    private func requestRemoval(_ tasks: [FocusTask]) {
+        pendingRemoval = tasks
+        confirmingRemoval = true
     }
 }
 
@@ -963,12 +614,12 @@ private struct TaskEditor: View {
     let task: FocusTask
     @Bindable var store: FocusStore
     var onChange: () -> Void
-    @State private var name: String = ""
-    @State private var target = ""
-    @State private var confirmingRemoval = false
-    @State private var isEditingElapsed = false
-    @State private var elapsedValue = ""
-    @State private var timerToResume: UUID?
+    var onRequestRemoval: () -> Void
+    @ViewState private var name = ""
+    @ViewState private var target = ""
+    @ViewState private var isEditingElapsed = false
+    @ViewState private var elapsedValue = ""
+    @ViewState private var timerToResume: UUID?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -981,7 +632,7 @@ private struct TaskEditor: View {
                     .onSubmit { save() }
                     .onAppear { target = DurationInput.display(task.targetSeconds) }
                 Button {
-                    confirmingRemoval = true
+                    onRequestRemoval()
                 } label: {
                     Image(systemName: "trash")
                 }
@@ -1009,9 +660,8 @@ private struct TaskEditor: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if isEditingElapsed {
-                    CommitOnBlurTextField(text: $elapsedValue, onCommit: commitElapsedEditing)
-                        .frame(width: 112)
-                    Button("Reset") { resetElapsed() }
+                    CommitOnBlurTextField(text: $elapsedValue, onCommit: commitElapsedEditing, onReset: resetElapsed)
+                        .frame(width: 180)
                 } else {
                     Button { beginElapsedEditing() } label: {
                         Text(store.formattedElapsed(for: task))
@@ -1022,31 +672,27 @@ private struct TaskEditor: View {
                 }
             }
             if isEditingElapsed && ElapsedInput.seconds(from: elapsedValue) == nil {
-                Text("Use H:MM or H:MM:SS. An invalid value keeps the previous time.")
+                Text("Use H, H:MM, or H:MM:SS; omitted parts become 00. An invalid value keeps the previous time.")
                     .font(.caption)
                     .foregroundStyle(.red)
             }
             HStack {
                 Spacer()
-                let streak = store.completionStreak(for: task)
-                Text(streak == 1 ? "1-day streak" : "\(streak)-day streak")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(streak > 0 ? Color.green : Color.secondary)
+                VStack(alignment: .trailing, spacing: 2) {
+                    let streaks = store.streaks(for: task)
+                    Text(streaks.completionLabel)
+                        .foregroundStyle(streaks.completedDays > 0 ? Color.green : Color.secondary)
+                    Text(streaks.thirtyMinuteLabel)
+                        .foregroundStyle(streaks.thirtyMinuteDays > 0 ? Color.green : Color.secondary)
+                        .help("Consecutive focus days with at least 30 minutes. Today counts once 30 minutes are reached.")
+                }
+                .font(.caption.weight(.medium))
             }
             HabitStrip(days: store.recentCompletions(for: task))
         }
         .onDisappear {
             save()
             commitElapsedEditing()
-        }
-        .confirmationDialog("Remove \(task.name)?", isPresented: $confirmingRemoval, titleVisibility: .visible) {
-            Button("Remove Focus Area", role: .destructive) {
-                store.remove(task)
-                onChange()
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Its recorded time and completion history will be removed.")
         }
     }
 
@@ -1092,6 +738,7 @@ private struct TaskEditor: View {
     }
 
     private func finishElapsedEditing(newValue: TimeInterval?) {
+        guard isEditingElapsed else { return }
         let resumeID = timerToResume
         isEditingElapsed = false
         elapsedValue = ""
@@ -1154,8 +801,8 @@ private struct AddTaskSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Bindable var store: FocusStore
     var onChange: () -> Void
-    @State private var name = ""
-    @State private var target = "1:00"
+    @ViewState private var name = ""
+    @ViewState private var target = "1:00"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
