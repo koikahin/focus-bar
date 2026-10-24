@@ -48,7 +48,8 @@ enum FocusSelfTests {
             try testCompletionNotificationStreaks()
             try testPillHoverPresentation()
             try testPillHoverElapsedSnapshot()
-            print("FocusBar self-tests passed (28/28)")
+            try testPillHoverAllLinesFit()
+            print("FocusBar self-tests passed (29/29)")
             return true
         } catch {
             FileHandle.standardError.write(Data("FocusBar self-test failed: \(error)\n".utf8))
@@ -333,14 +334,14 @@ enum FocusSelfTests {
         let renderer = PillRenderer(statusItem: item)
         renderer.render(tracking, streaks: full)
         let image = item.button?.image
-        try expect(renderer.hoverText == "pd · Tracking\n3-day streak\n8-day (30 min) streak", "pill hover must show both streaks for its area")
+        try expect(renderer.hoverText == "pd\n3-day streak\n8-day (30 min) streak", "pill hover must show both streaks for its area")
         renderer.render(tracking, streaks: fallback)
-        try expect(renderer.hoverText == "pd · Tracking\n0-day streak\n3-day (30 min) streak", "hover text must refresh even when visual pill state is unchanged")
+        try expect(renderer.hoverText == "pd\n0-day streak\n3-day (30 min) streak", "hover text must refresh even when visual pill state is unchanged")
         try expect(item.button?.image === image, "updating hover streaks must preserve the rendered image")
         renderer.render(idleFallback, streaks: fallback)
         try expect(item.button?.image?.isTemplate == true, "idle streak labels must retain native template rendering")
         renderer.render(PillState(title: "work", isTracking: false, elapsed: 0, target: 3_600, streaks: zero), streaks: zero)
-        try expect(renderer.hoverText == "work · Stopped\n0-day streak\n0-day (30 min) streak", "selection changes must switch both hover streaks to the new area")
+        try expect(renderer.hoverText == "work\n0-day streak\n0-day (30 min) streak", "selection changes must switch both hover streaks to the new area")
         for name in ["pd", "work", "personal development"] {
             for useFallback in [false, true] {
                 var previousWidth: CGFloat = 0
@@ -377,9 +378,12 @@ enum FocusSelfTests {
                                   context: nil, eventNumber: 1, trackingNumber: 0, userData: nil)!
         }
         func containsDetails(_ view: NSView) -> Bool {
-            if let label = view as? NSTextField,
-               label.stringValue.contains("12-day streak") && label.stringValue.contains("123-day (30 min) streak") { return true }
-            return view.subviews.contains(where: containsDetails)
+            func strings(in view: NSView) -> [String] {
+                if let label = view as? NSTextField { return [label.stringValue] }
+                return view.subviews.flatMap { strings(in: $0) }
+            }
+            let text = strings(in: view).joined(separator: "\n")
+            return text.contains("12-day streak") && text.contains("123-day (30 min) streak")
         }
         func hoverWindows() -> [NSWindow] {
             NSApp.windows.filter { $0.isVisible && $0.contentView.map(containsDetails) == true }
@@ -445,19 +449,68 @@ enum FocusSelfTests {
         clock.now = clock.now.addingTimeInterval(4)
         owner.mouseEntered(with: event(.mouseEntered))
         RunLoop.main.run(until: Date.now.addingTimeInterval(0.5))
-        try expect(isVisible("work · Tracking · Today 1:01:05"), "tracking hover must capture elapsed time when the panel opens, rather than when the pill was last rendered")
+        try expect(isVisible("work · 1:01:05"), "tracking hover must capture elapsed time when the panel opens, rather than when the pill was last rendered")
         try expect(captures == 1, "opening hover must capture elapsed time exactly once")
         clock.now = clock.now.addingTimeInterval(10)
         render()
         RunLoop.main.run(until: Date.now.addingTimeInterval(0.05))
-        try expect(isVisible("Today 1:01:05") && captures == 1, "elapsed time must remain a fixed snapshot while hovering, even if a visible display refreshes")
+        try expect(isVisible("work · 1:01:05") && captures == 1, "elapsed time must remain a fixed snapshot while hovering, even if a visible display refreshes")
         try expect(item.button?.image === image, "hover elapsed time must not redraw the pill")
         owner.mouseExited(with: event(.mouseExited))
         store.finishCurrentSession()
         render()
         owner.mouseEntered(with: event(.mouseEntered))
         RunLoop.main.run(until: Date.now.addingTimeInterval(0.5))
-        try expect(isVisible("work · Stopped · Today 1:01:15") && captures == 2, "a new stopped hover must show a fresh snapshot of the current focus-day total")
+        try expect(isVisible("work · 1:01:15") && captures == 2, "a new stopped hover must show a fresh snapshot of the current focus-day total")
+    }
+
+    private static func testPillHoverAllLinesFit() throws {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        defer { NSStatusBar.system.removeStatusItem(item) }
+        let renderer = PillRenderer(statusItem: item, elapsedSnapshot: { "123:45:56" })
+        defer { renderer.dismissHover() }
+        let streaks = FocusStreaks(completedDays: 12, thirtyMinuteDays: 1_234)
+        renderer.render(PillState(title: "work", isTracking: true, elapsed: 0, target: 3_600, streaks: streaks), streaks: streaks)
+        let button = item.button!
+        let owner = button.trackingAreas.compactMap { $0.owner as? PillHover }.first!
+        let event = NSEvent.enterExitEvent(with: .mouseEntered, location: .zero, modifierFlags: [], timestamp: 0,
+                                          windowNumber: button.window!.windowNumber, context: nil,
+                                          eventNumber: 1, trackingNumber: 0, userData: nil)!
+        owner.mouseEntered(with: event)
+        RunLoop.main.run(until: Date.now.addingTimeInterval(0.5))
+        func labels(in view: NSView) -> [NSTextField] {
+            if let field = view as? NSTextField { return [field] }
+            return view.subviews.flatMap { labels(in: $0) }
+        }
+        for (name, title) in [("short", "work"), ("wrapped", "Professional development and daily study with a longer focus area name")] {
+            owner.update(title: title, streaks: streaks)
+            guard let panel = NSApp.windows.first(where: {
+                $0.isVisible && $0.contentView.map { labels(in: $0).contains { $0.stringValue == streaks.thirtyMinuteLabel } } == true
+            }), let view = panel.contentView else {
+                throw Failure(description: "missing rendered hover details for clipping test")
+            }
+            let fields = labels(in: view).filter { !$0.isHidden }
+            let expected = ["\(title) · 123:45:56", streaks.completionLabel, streaks.thirtyMinuteLabel]
+            try expect(fields.count == 3 && expected.allSatisfy { text in fields.contains { $0.stringValue == text } },
+                       "hover must contain only the compact header and both separate streak rows")
+            var clipping: [String] = []
+            for field in fields {
+                guard let cell = field.cell else { throw Failure(description: "hover label has no native text cell") }
+                let required = cell.cellSize(forBounds: NSRect(x: 0, y: 0, width: field.bounds.width, height: 10_000))
+                if field.bounds.height < required.height || !view.bounds.contains(field.convert(field.bounds, to: view)) {
+                    clipping.append("\(field.stringValue): height \(field.bounds.height), required \(required.height), rect \(field.convert(field.bounds, to: view)), panel bounds \(view.bounds)")
+                }
+            }
+            if !clipping.isEmpty || CommandLine.arguments.contains("--hover-previews") {
+                guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
+                    throw Failure(description: "could not capture native hover layout")
+                }
+                view.cacheDisplay(in: view.bounds, to: bitmap)
+                guard let png = bitmap.representation(using: .png, properties: [:]) else { throw Failure(description: "could not encode hover layout image") }
+                try png.write(to: URL(fileURLWithPath: "/tmp/FocusBarHover-\(name).png"))
+            }
+            try expect(clipping.isEmpty, "hover clips its labels: \(clipping.joined(separator: "; ")); see /tmp/FocusBarHover-\(name).png")
+        }
     }
 
     private static func testThirtyMinuteRefreshWithoutPolling() throws {

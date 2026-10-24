@@ -32,9 +32,9 @@ FocusBar is a native macOS menu-bar app for tracking focused time against a smal
 - Idle text and sizing must use native template-based menu-bar rendering so the label is centered from its actual visible content and dims like neighboring menu-bar items on an inactive display.
 - The completed idle treatment may add the green outline separately, but the label must retain the native template behavior.
 - The appearance must remain readable in both macOS light and dark modes.
-- Hovering over the pill shows the selected area's tracking/completion state and both its daily-target and 30-minute streaks. Refresh the hover text when either streak changes without redrawing an otherwise unchanged pill.
+- Hovering over the pill shows the selected area's name and elapsed time, with its daily-target and 30-minute streaks on separate rows underneath. Keep both streaks fully visible, including when the header wraps or counts have several digits. Use native label fitting sizes rather than estimating text height. Refresh the streaks without redrawing an otherwise unchanged pill.
 - Present the hover details in a native, nonactivating tooltip-style panel after a brief hover, using tracking that remains active while FocusBar is in the background. Dismiss it on pointer exit, pill clicks, system interruption, and quit. Hover must never start tracking, open the management window, or activate FocusBar.
-- Beside `Stopped` or `Tracking`, include the selected area's current focus-day elapsed time as `Today H:MM:SS`. Capture it once when the hover panel actually opens, retain that snapshot while the panel remains open, and take a fresh value on the next hover. Do not add a recurring timer or per-second refresh for this time.
+- Format the hover header as `work · H:MM:SS`, without `Today`, `Stopped`, `Tracking`, or completion-status words. Capture the current focus-day elapsed time once when the hover panel actually opens, retain that snapshot while the panel remains open, and take a fresh value on the next hover. Do not add a recurring timer or per-second refresh for this time.
 
 ## Right-click status menu
 
@@ -143,4 +143,5 @@ FocusBar is a native macOS menu-bar app for tracking focused time against a smal
 - Preserve tests for selection-versus-start behavior, elapsed overrides, pause/resume around editing, 6:00 AM rollover after sleep, interruption-notification deduplication, historical daily targets, completion events, removal, and pill spacing/template rendering.
 - Cover authorization queueing, permission and delivery failures, and saved-data decoding/encoding failures. A signed app's `--test-notification` mode must exercise a real target deadline in an isolated test profile and verify delivery through macOS without changing the user's focus data.
 - Test actual hover event delivery and visible native hover details, including background-app tracking, pointer exit, quick-pass cancellation, action dismissal, and preservation of app activation and keyboard focus; checking a tooltip text property alone is insufficient.
+- Verify that every hover label fits its native text-cell size and remains inside the panel for compact and wrapped headers with multi-digit streaks. Support `swift run FocusBar --self-test --hover-previews` to export isolated native hover previews for visual checks.
 - For requested releases, build, stop the current installed run, reinstall, relaunch, and verify only one FocusBar instance is running.

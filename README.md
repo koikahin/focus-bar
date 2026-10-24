@@ -32,13 +32,15 @@ Each area shows its daily-target streak with a separate `x-day (30 min) streak` 
 
 Hover over the pill to see both streaks for its selected area in a native tooltip-style panel, even while FocusBar is in the background. It appears after a brief hover and closes on pointer exit or a pill click, without activating the app. Target-complete notifications include both streaks too. While stopped and below today's target, the pill shows a count such as `pd 3`: the daily-target streak takes precedence. If that streak is zero, a nonzero 30-minute streak appears as `pd 3*`. If both are zero, it shows `pd 0` without an asterisk. Pill labels use a compact, readable 11-point semibold font. Tracking and completed-today pills keep the plain name.
 
-The hover header also shows today's elapsed time beside `Stopped` or `Tracking`, for example `work · Tracking · Today 1:23:45`. This value is captured when the panel opens and stays fixed until the next hover, with no additional live timer.
+The hover header shows the area and today's elapsed time, for example `work · 1:23:45`, with the daily-target streak and 30-minute streak on separate rows underneath. This time is captured when the panel opens and stays fixed until the next hover, with no additional live timer. The panel uses native label sizing so wrapped headers and longer streaks remain fully visible.
 
 ## Verification
 
 Before each daily reset, FocusBar writes a separate JSON copy of all tracking data to `~/Library/Application Support/FocusBar/Backups`. It retains the two most recent completed focus-day versions, including their earlier history. These files survive deletion of the main preferences file during development and use the same snapshot format for restoration. If a backup fails, tracking stops and the reset is postponed; a native alert offers Retry or Later.
 
 Run `swift run FocusBar --self-test` for behavior checks. Run `swift run FocusBar --render-test` for a live CPU benchmark of all four pill states; it temporarily adds a `test` pill without changing your recorded focus data. The tracking pill uses a single image rather than a text-field subview to avoid an AppKit menu-bar snapshot redraw loop.
+
+Add `--hover-previews` to the self-test command to export `/tmp/FocusBarHover-short.png` and `/tmp/FocusBarHover-wrapped.png` from isolated test data. The layout checks verify both streaks fit, including with a wrapped header and multi-digit counts.
 
 The packaged app is signed and verified so macOS can authorize its notifications. Completion notices use a normal system banner and sound, respecting your notification settings. Permission and delivery errors are logged and shown immediately in a native error dialog. Unreadable saved data or snapshot encoding errors show an error and quit while preserving existing preferences.
 

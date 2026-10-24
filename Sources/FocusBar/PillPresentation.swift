@@ -56,14 +56,14 @@ final class PillRenderer {
 
     func render(_ state: PillState, streaks: FocusStreaks? = nil) {
         guard let button = statusItem.button else { preconditionFailure("Missing status bar button") }
-        var toolTip = "\(state.areaTitle) · \(state.isTracking ? "Tracking" : "Stopped")\(state.isComplete ? " · Daily target complete" : "")"
+        var toolTip = state.areaTitle
         if let streaks { toolTip += "\n\(streaks.summary)" }
         if hoverText != toolTip {
             hoverText = toolTip
             button.setAccessibilityHelp(toolTip)
         }
         guard state != renderedState else {
-            hover.update(text: toolTip)
+            hover.update(title: state.areaTitle, streaks: streaks)
             return
         }
         renderedState = state
@@ -82,7 +82,7 @@ final class PillRenderer {
             outline.frame = button.bounds
             button.addSubview(outline)
         }
-        hover.update(text: toolTip)
+        hover.update(title: state.areaTitle, streaks: streaks)
     }
 
     func dismissHover() { hover.dismiss() }

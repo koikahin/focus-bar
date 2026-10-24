@@ -7,8 +7,11 @@ final class PillHover: NSResponder {
     private weak var button: NSStatusBarButton?
     private var hoverTimer: Timer?
     private var panel: NSPanel?
-    private let label = NSTextField(wrappingLabelWithString: "")
-    private var text = ""
+    private let headerLabel = NSTextField(wrappingLabelWithString: "")
+    private let completionLabel = NSTextField(wrappingLabelWithString: "")
+    private let thirtyMinuteLabel = NSTextField(wrappingLabelWithString: "")
+    private var title = ""
+    private var streaks: FocusStreaks?
     private var isHovered = false
     private let elapsedSnapshot: @MainActor () -> String?
     private var elapsedAtPresentation: String?
@@ -17,15 +20,23 @@ final class PillHover: NSResponder {
         self.button = button
         self.elapsedSnapshot = elapsedSnapshot
         super.init()
+        for label in [headerLabel, completionLabel, thirtyMinuteLabel] {
+            label.font = .systemFont(ofSize: 12)
+            label.textColor = .labelColor
+            label.isSelectable = false
+            label.maximumNumberOfLines = 0
+            label.preferredMaxLayoutWidth = 320
+        }
         button.addTrackingArea(NSTrackingArea(rect: .zero,
             options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
     }
 
     required init?(coder: NSCoder) { fatalError("PillHover does not support decoding") }
 
-    func update(text: String) {
-        guard self.text != text else { return }
-        self.text = text
+    func update(title: String, streaks: FocusStreaks?) {
+        guard self.title != title || self.streaks != streaks else { return }
+        self.title = title
+        self.streaks = streaks
         if panel?.isVisible == true { present() }
     }
 
@@ -49,14 +60,14 @@ final class PillHover: NSResponder {
 
     @objc private func present() {
         hoverTimer = nil
-        guard isHovered, !text.isEmpty, let button, let window = button.window, window.isVisible else { return }
+        guard isHovered, !title.isEmpty, let button, let window = button.window, window.isVisible else { return }
         guard let screen = window.screen else { preconditionFailure("Visible status button has no screen") }
         if panel?.isVisible != true { elapsedAtPresentation = elapsedSnapshot() }
-        var displayText = text
-        if let elapsedAtPresentation {
-            let endOfHeader = displayText.firstIndex(of: "\n") ?? displayText.endIndex
-            displayText.insert(contentsOf: " · Today \(elapsedAtPresentation)", at: endOfHeader)
-        }
+        headerLabel.stringValue = elapsedAtPresentation.map { "\(title) · \($0)" } ?? title
+        completionLabel.stringValue = streaks?.completionLabel ?? ""
+        thirtyMinuteLabel.stringValue = streaks?.thirtyMinuteLabel ?? ""
+        completionLabel.isHidden = streaks == nil
+        thirtyMinuteLabel.isHidden = streaks == nil
         let panel: NSPanel
         if let existing = self.panel {
             panel = existing
@@ -76,22 +87,34 @@ final class PillHover: NSResponder {
             background.wantsLayer = true
             background.layer?.cornerRadius = 7
             background.layer?.masksToBounds = true
-            background.addSubview(label)
+            for label in [headerLabel, completionLabel, thirtyMinuteLabel] { background.addSubview(label) }
             panel.contentView = background
             self.panel = panel
         }
         panel.appearance = button.effectiveAppearance
-        let content = NSAttributedString(string: displayText, attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.labelColor])
-        label.attributedStringValue = content
-        label.preferredMaxLayoutWidth = 320
-        let bounds = content.boundingRect(with: NSSize(width: 320, height: CGFloat.greatestFiniteMagnitude), options: [.usesLineFragmentOrigin, .usesFontLeading])
-        let size = NSSize(width: ceil(bounds.width) + 24, height: ceil(bounds.height) + 20)
+        let rows = [headerLabel, completionLabel, thirtyMinuteLabel].filter { !$0.isHidden }
+        // Ask each actual text field for its size, including native cell
+        // padding and wrapping. String bounding boxes omit those insets.
+        let sizes = rows.map { label in
+            guard let cell = label.cell else { preconditionFailure("Hover label has no native text cell") }
+            let width = min(320, ceil(cell.cellSize.width))
+            let fitting = cell.cellSize(forBounds: NSRect(x: 0, y: 0, width: width, height: 10_000))
+            precondition(width.isFinite && width > 0 && fitting.height.isFinite && fitting.height > 0, "Hover label has no fitting size")
+            return NSSize(width: width, height: ceil(fitting.height))
+        }
+        guard let contentWidth = sizes.map(\.width).max() else { preconditionFailure("Hover has no visible rows") }
+        let size = NSSize(width: contentWidth + 24,
+                          height: sizes.reduce(0) { $0 + $1.height } + CGFloat(rows.count - 1) * 2 + 20)
         let anchor = window.convertToScreen(button.convert(button.bounds, to: nil))
         let screenFrame = screen.visibleFrame
         let x = min(max(anchor.midX - size.width / 2, screenFrame.minX), screenFrame.maxX - size.width)
         let y = max(screenFrame.minY, anchor.minY - size.height - 6)
         panel.setFrame(NSRect(origin: NSPoint(x: x, y: y), size: size), display: false)
-        label.frame = NSRect(x: 12, y: 10, width: size.width - 24, height: size.height - 20)
+        var top = size.height - 10
+        for (label, fitting) in zip(rows, sizes) {
+            label.frame = NSRect(x: 12, y: top - fitting.height, width: fitting.width, height: fitting.height)
+            top -= fitting.height + 2
+        }
         panel.orderFrontRegardless()
     }
 }
